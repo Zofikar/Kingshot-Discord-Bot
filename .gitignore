@@ -7,6 +7,10 @@
 !autoupdateinfo.txt
 !cogs/
 !cogs/*.py
+!extension/
+!extension/**
+!MIGRATION.md
+!FEATURE_PARITY.md
 !.gitlab-ci.yml
 !install/
 !install/*

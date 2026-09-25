@@ -1664,11 +1664,18 @@ if __name__ == "__main__":
             except Exception as e:
                 failed_cogs.append((cog, str(e)))
 
+        # Load the self-hosted extension package (verification + NAP + calendar).
+        # Fork-specific addition: upstream releases don't include this package.
+        try:
+            await bot.load_extension("extension")
+        except Exception as e:
+            failed_cogs.append(("extension", str(e)))
+
         sys.stdout = _real_stdout
         sys.stderr = _real_stderr
         logging.disable(logging.NOTSET)
 
-        total = len(cogs)
+        total = len(cogs) + 1
         loaded = total - len(failed_cogs)
         if failed_cogs:
             startup.phase_fail(
