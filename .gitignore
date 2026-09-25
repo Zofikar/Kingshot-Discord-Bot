@@ -23,3 +23,11 @@
 !.github/workflows/docker.yml
 !tests/
 !tests/**
+!Dockerfile
+!entrypoint.sh
+!.dockerignore
+
+# Never track Python bytecode — the `!extension/**` re-include above would
+# otherwise pull __pycache__/*.pyc into version control.
+__pycache__/
+*.pyc

@@ -1,0 +1,17 @@
+.git
+.gitignore
+.pytest_cache
+__pycache__
+**/__pycache__
+*.pyc
+tests
+docker
+install
+.github
+.gitlab-ci.yml
+db
+log
+bot_token.txt
+.env
+version
+autoupdateinfo.txt
