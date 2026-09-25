@@ -27,7 +27,7 @@ USERS_FILE = "users.sqlite"
 ALLIANCE_FILE = "alliance.sqlite"
 SETTINGS_FILE = "settings.sqlite"
 
-NAP_SECTIONS = ("nap_breakings", "nap_tag_aliases", "academies", "nap_exclusions")
+NAP_SECTIONS = ("nap_breakings", "nap_tag_aliases", "academies", "academy_tags", "nap_exclusions")
 
 # Columns added on top of the base schemas below. This includes BOTH the columns
 # upstream's create_tables() adds via ALTER (so a standalone migration produces a
@@ -89,8 +89,9 @@ CREATE TABLE IF NOT EXISTS nap_tag_aliases (
     aid INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS academies (
-    main_aid    TEXT PRIMARY KEY,
-    academy_aid INTEGER NOT NULL
+    main_aid     TEXT PRIMARY KEY,
+    academy_aid  INTEGER NOT NULL,
+    academy_abbr TEXT
 );
 CREATE TABLE IF NOT EXISTS nap_exclusions (
     aid         TEXT PRIMARY KEY,
@@ -135,6 +136,7 @@ def ensure_schema(db_dir: str = "db") -> None:
     """Create the NAP tables and add the extension's columns to upstream tables."""
     with _connect(os.path.join(db_dir, VERIFICATION_FILE)) as conn:
         conn.executescript(NAP_SCHEMA)
+        _ensure_columns(conn, "academies", {"academy_abbr": "TEXT"})
 
     with _connect(os.path.join(db_dir, USERS_FILE)) as conn:
         conn.executescript(USERS_SCHEMA)
@@ -174,6 +176,8 @@ class Storage:
 
             for row in conn.execute("SELECT * FROM academies"):
                 result["academies"][row["main_aid"]] = row["academy_aid"]
+                if row["academy_abbr"]:
+                    result["academy_tags"][str(row["academy_aid"])] = row["academy_abbr"]
 
             for row in conn.execute("SELECT * FROM nap_exclusions"):
                 result["nap_exclusions"][row["aid"]] = _load(row["record_json"])
@@ -201,10 +205,12 @@ class Storage:
                         (str(tag), int(aid)),
                     )
 
+                academy_tags = data.get("academy_tags", {})
                 for main_aid, academy_aid in data.get("academies", {}).items():
+                    abbr = academy_tags.get(str(academy_aid))
                     conn.execute(
-                        "INSERT INTO academies (main_aid, academy_aid) VALUES (?, ?)",
-                        (str(main_aid), int(academy_aid)),
+                        "INSERT INTO academies (main_aid, academy_aid, academy_abbr) VALUES (?, ?, ?)",
+                        (str(main_aid), int(academy_aid), abbr),
                     )
 
                 for aid, record in data.get("nap_exclusions", {}).items():

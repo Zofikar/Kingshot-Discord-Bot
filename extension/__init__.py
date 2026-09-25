@@ -10,6 +10,7 @@ The ``setup`` entrypoint wires the pieces in order:
 """
 
 import logging
+import os
 
 from . import config
 

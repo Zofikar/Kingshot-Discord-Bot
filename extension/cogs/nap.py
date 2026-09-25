@@ -33,6 +33,7 @@ def _nap_context(bot):
         alliances=alliances,
         nap_tag_aliases=nap_state["nap_tag_aliases"],
         academies=nap_state["academies"],
+        academy_tags=nap_state["academy_tags"],
         nap_exclusions=nap_state["nap_exclusions"],
     )
     return logic, nap_state
@@ -41,6 +42,7 @@ def _nap_context(bot):
 def _save_nap(logic, nap_state):
     nap_state["nap_tag_aliases"] = logic.nap_tag_aliases
     nap_state["academies"] = logic.academies
+    nap_state["academy_tags"] = logic.academy_tags
     nap_state["nap_exclusions"] = logic.nap_exclusions
     storage.Storage().save(nap_state)
 
@@ -166,7 +168,7 @@ class Nap(commands.Cog):
         if not state["current"]:
             await interaction.followup.send("No NAP-protected alliances.", ephemeral=True)
             return
-        lines = [f"{i}. [{r['abbr']}] {r['name']} - {r['power']:,}" for i, r in enumerate(state["current"], 1)]
+        lines = logic.build_nap_protected_lines(state["current"])
         if days > 0:
             if state["fallen_protected"]:
                 lines.append("")
@@ -246,7 +248,7 @@ class Nap(commands.Cog):
             if academy_aid is None:
                 await interaction.followup.send(f"Could not resolve academy tag `{academy_tag}`.", ephemeral=True)
                 return
-        if logic.set_alliance_academy(main_aid, academy_aid):
+        if logic.set_alliance_academy(main_aid, academy_aid, academy_tag=academy_tag):
             _save_nap(logic, nap_state)
             await interaction.followup.send("Academy updated.", ephemeral=True)
         else:

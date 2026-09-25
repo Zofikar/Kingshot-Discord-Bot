@@ -49,6 +49,7 @@ def _nap_logic(bot):
         alliances=_alliances_dict(),
         nap_tag_aliases=state["nap_tag_aliases"],
         academies=state["academies"],
+        academy_tags=state["academy_tags"],
         nap_exclusions=state["nap_exclusions"],
     )
 

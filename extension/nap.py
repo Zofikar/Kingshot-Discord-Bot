@@ -17,11 +17,12 @@ class NapLogic:
     )
 
     def __init__(self, *, nap_alliances_count=10, alliances=None, nap_tag_aliases=None,
-                 academies=None, nap_exclusions=None):
+                 academies=None, academy_tags=None, nap_exclusions=None):
         self.NAP_ALLIANCES_COUNT = nap_alliances_count
         self.alliances = alliances if alliances is not None else {}
         self.nap_tag_aliases = nap_tag_aliases if nap_tag_aliases is not None else {}
         self.academies = academies if academies is not None else {}
+        self.academy_tags = academy_tags if academy_tags is not None else {}
         self.nap_exclusions = nap_exclusions if nap_exclusions is not None else {}
 
     def save_data(self):
@@ -29,7 +30,13 @@ class NapLogic:
 
     def get_tag_for_aid(self, aid):
         stored = self.alliances.get(str(aid)) or {}
-        return stored.get("abbr")
+        abbr = stored.get("abbr")
+        if abbr:
+            return abbr
+        # Academy tags are persisted at registration time, so an academy that
+        # has no member on Discord and wasn't fetched by the NAP ranking still
+        # resolves its tag here (fixes missing "(ac: [TAG])" in NAP posts).
+        return self.academy_tags.get(str(aid))
 
     def _resolve_aid_for_tag(self, tag, *, exact_only=False):
         if not tag:
@@ -149,7 +156,7 @@ class NapLogic:
             self.save_data()
         return removed
 
-    def set_alliance_academy(self, main_aid, academy_aid):
+    def set_alliance_academy(self, main_aid, academy_aid, academy_tag=None):
         main_key = str(main_aid)
         if academy_aid is None:
             if main_key in self.academies:
@@ -162,6 +169,15 @@ class NapLogic:
                 return False
         except (TypeError, ValueError):
             return False
+
+        # Persist the academy tag so it survives even when the academy has no
+        # row in alliance_list (no Discord member, not fetched by NAP ranking).
+        tag = academy_tag or self.get_tag_for_aid(academy_val)
+        if tag:
+            tag = str(tag).strip()
+            if not tag:
+                tag = None
+
         changed = False
         for other_key, other_val in list(self.academies.items()):
             try:
@@ -171,8 +187,12 @@ class NapLogic:
             except (TypeError, ValueError):
                 continue
         if self.academies.get(main_key) == academy_val:
+            if tag:
+                self.academy_tags[str(academy_val)] = tag
             return changed
         self.academies[main_key] = academy_val
+        if tag:
+            self.academy_tags[str(academy_val)] = tag
         return True
 
     def get_main_aid_for_academy(self, academy_aid):
@@ -209,6 +229,24 @@ class NapLogic:
         for i in range(0, len(tags), 3):
             lines.append(" ".join(tags[i:i + 3]))
         return "\n".join(lines)
+
+    def build_nap_protected_lines(self, current):
+        """Format current-snapshot rows for /nap_protected, annotating academies.
+
+        Each main alliance with a registered academy gets a ``(ac: [TAG])``
+        suffix, mirroring the ranking post. Academy alliances themselves never
+        appear as standalone rows (they are dropped from the snapshot).
+        """
+        lines = []
+        for i, r in enumerate(current, 1):
+            ac_aid = self.academies.get(str(r["aid"]))
+            ac_note = ""
+            if ac_aid is not None:
+                ac_tag = self.get_tag_for_aid(ac_aid)
+                if ac_tag:
+                    ac_note = f" (ac: [{ac_tag}])"
+            lines.append(f"{i}. [{r['abbr']}] {r['name']} - {r['power']:,}{ac_note}")
+        return lines
 
     def build_nap_tag_list(self, ranked, academy_tags=None, fallen_protected=None):
         tags = []

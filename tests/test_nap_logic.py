@@ -111,3 +111,59 @@ def test_tag_list_filters_excluded():
     logic.set_nap_exclusion(12, reason="x", added_by="admin", tag="A12")
     tags = logic.build_nap_tag_list([{"aid": 12, "abbr": "A12"}, {"aid": 10, "abbr": "A10"}], {}, [])
     assert tags == ["A10"]
+
+
+def test_nap_protected_lines_annotate_academy():
+    logic = _logic(
+        alliances={
+            "10": {"abbr": "MNX", "name": "FAMILLY", "power": 235},
+            "20": {"abbr": "A15", "name": "Academy", "power": 10},
+        },
+        academies={"10": 20},
+    )
+    current = [{"aid": 10, "abbr": "MNX", "name": "FAMILLY", "power": 235}]
+    assert logic.build_nap_protected_lines(current) == ["1. [MNX] FAMILLY - 235 (ac: [A15])"]
+
+
+def test_nap_protected_lines_without_academy():
+    logic = _logic(alliances={"10": {"abbr": "MNX", "name": "FAMILLY", "power": 235}})
+    current = [{"aid": 10, "abbr": "MNX", "name": "FAMILLY", "power": 235}]
+    assert logic.build_nap_protected_lines(current) == ["1. [MNX] FAMILLY - 235"]
+
+
+def test_get_tag_for_aid_falls_back_to_academy_tags():
+    # Academy has no alliance_list row (no Discord member / not NAP-fetched),
+    # but its tag is persisted in academy_tags.
+    logic = _logic(academies={"10": 20}, academy_tags={"20": "MNx"})
+    assert logic.get_tag_for_aid(20) == "MNx"
+
+
+def test_set_academy_persists_tag():
+    logic = _logic()
+    logic.set_alliance_academy(10, 20, academy_tag="MNx")
+    assert logic.get_tag_for_aid(20) == "MNx"
+    assert logic.academy_tags == {"20": "MNx"}
+
+
+def test_build_nap_message_academy_from_persisted_tag():
+    logic = _logic(
+        alliances={"10": {"abbr": "MNX", "name": "FAMILLY", "power": 235}},
+        academies={"10": 20},
+        academy_tags={"20": "MNx"},
+    )
+    ranked = [{"aid": 10, "abbr": "MNX", "name": "FAMILLY", "power": 235}]
+    academy_tags = {str(k): logic.get_tag_for_aid(v) for k, v in logic.academies.items()}
+    msg = NapLogic.build_nap_message(ranked, academy_tags)
+    assert msg == "1. [MNX] FAMILLY - 235 (ac: [MNx])"
+
+
+def test_build_nap_tag_list_includes_persisted_academy_tag():
+    logic = _logic(
+        alliances={"10": {"abbr": "MNX", "name": "FAMILLY", "power": 235}},
+        academies={"10": 20},
+        academy_tags={"20": "MNx"},
+    )
+    ranked = [{"aid": 10, "abbr": "MNX", "name": "FAMILLY", "power": 235}]
+    academy_tags = {str(k): logic.get_tag_for_aid(v) for k, v in logic.academies.items()}
+    tags = logic.build_nap_tag_list(ranked, academy_tags, [])
+    assert tags == ["MNX", "MNx"]
