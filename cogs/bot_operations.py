@@ -441,7 +441,7 @@ class BotOperations(commands.Cog):
             if current_version.startswith("beta-"):
                 return current_version, current_version, [], False
 
-            latest_release_url = "https://api.github.com/repos/kingshot-project/Kingshot-Discord-Bot/releases/latest"
+            latest_release_url = "https://api.github.com/repos/Zofikar/Kingshot-Discord-Bot/releases/latest"
 
             response = await asyncio.to_thread(requests.get, latest_release_url, timeout=10)
             if response.status_code != 200:

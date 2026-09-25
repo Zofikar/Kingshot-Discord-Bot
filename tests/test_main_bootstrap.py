@@ -115,13 +115,13 @@ def test_env_var_overrides_default_url(monkeypatch):
     # Mirror the exact lookup main.py performs in its ImportError branch.
     resolved = os.environ.get(
         "BOT_BOOTSTRAP_URL",
-        "https://github.com/kingshot-project/Kingshot-Discord-Bot/archive/refs/heads/main.zip",
+        "https://github.com/Zofikar/Kingshot-Discord-Bot/archive/refs/heads/main.zip",
     )
     assert resolved == "file:///tmp/override.zip"
 
     monkeypatch.delenv("BOT_BOOTSTRAP_URL", raising=False)
     resolved = os.environ.get(
         "BOT_BOOTSTRAP_URL",
-        "https://github.com/kingshot-project/Kingshot-Discord-Bot/archive/refs/heads/main.zip",
+        "https://github.com/Zofikar/Kingshot-Discord-Bot/archive/refs/heads/main.zip",
     )
-    assert resolved == "https://github.com/kingshot-project/Kingshot-Discord-Bot/archive/refs/heads/main.zip"
+    assert resolved == "https://github.com/Zofikar/Kingshot-Discord-Bot/archive/refs/heads/main.zip"

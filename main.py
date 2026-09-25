@@ -73,7 +73,7 @@ except ImportError:
     # cogs/ is missing (likely a bare main.py drop). Fetch the full source for this branch and restart.
     _bootstrap_from_main_branch(os.environ.get(
         "BOT_BOOTSTRAP_URL",
-        "https://github.com/kingshot-project/Kingshot-Discord-Bot/archive/refs/heads/main.zip",
+        "https://github.com/Zofikar/Kingshot-Discord-Bot/archive/refs/heads/main.zip",
     ))
     print("Download complete. Restarting...")
     if sys.platform == "win32":
@@ -409,7 +409,7 @@ def has_obsolete_requirements():
 UPDATE_SOURCES = [
     {
         "name": "GitHub",
-        "api_url": "https://api.github.com/repos/kingshot-project/Kingshot-Discord-Bot/releases/latest",
+        "api_url": "https://api.github.com/repos/Zofikar/Kingshot-Discord-Bot/releases/latest",
         "primary": True
     }
 ]
@@ -498,9 +498,9 @@ def download_requirements_from_release(beta_mode=False):
     # Build raw URL based on source and mode
     if source_name == "GitHub" or "GitHub" in source_name:
         if beta_mode:
-            raw_url = "https://raw.githubusercontent.com/kingshot-project/Kingshot-Discord-Bot/main/requirements.txt"
+            raw_url = "https://raw.githubusercontent.com/Zofikar/Kingshot-Discord-Bot/main/requirements.txt"
         else:
-            raw_url = f"https://raw.githubusercontent.com/kingshot-project/Kingshot-Discord-Bot/refs/tags/{tag}/requirements.txt"
+            raw_url = f"https://raw.githubusercontent.com/Zofikar/Kingshot-Discord-Bot/refs/tags/{tag}/requirements.txt"
     else:
         return False
 
@@ -699,7 +699,7 @@ def setup_dependencies(beta_mode=False):
 
     if not os.path.exists("requirements.txt"):
         if not download_requirements_from_release(beta_mode=beta_mode):
-            startup.phase_fail("Dependencies failed", details=["Could not download requirements.txt"], fix="Download the complete bot package from: https://github.com/kingshot-project/Kingshot-Discord-Bot/releases")
+            startup.phase_fail("Dependencies failed", details=["Could not download requirements.txt"], fix="Download the complete bot package from: https://github.com/Zofikar/Kingshot-Discord-Bot/releases")
             return False
 
     if not check_and_install_requirements():
