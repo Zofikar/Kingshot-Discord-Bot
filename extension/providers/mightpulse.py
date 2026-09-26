@@ -267,10 +267,10 @@ async def refresh_site_player(uid: int, force: bool) -> dict | None:
                 except json.JSONDecodeError:
                     return None
 
-            raw_player = data.get("player")
-            if isinstance(raw_player, dict):
-                return normalize_site_player(raw_player)
-
+            # When MightPulse merely *accepts* the refresh (queued/started), the
+            # embedded `player` payload is the pre-refresh (stale) data. Poll for
+            # completion, then return None so the caller re-reads the public API
+            # (now fresh) instead of trusting the stale payload.
             if data.get("queued") or data.get("accepted") or data.get("started"):
                 for _ in range(SITE_REFRESH_MAX_POLLS):
                     await asyncio.sleep(SITE_REFRESH_POLL_SECONDS)
@@ -284,6 +284,11 @@ async def refresh_site_player(uid: int, force: bool) -> dict | None:
                     )
                     if not status.get("queued") and not status.get("started"):
                         break
+                return None
+
+            raw_player = data.get("player")
+            if isinstance(raw_player, dict):
+                return normalize_site_player(raw_player)
 
             return None
 
@@ -340,10 +345,14 @@ async def fetch_player_data(
         cache_player(gid, site_player)
         return site_player
 
-    envelope2 = await fetch_player_envelope(gid)
-    if isinstance(envelope2, dict) and envelope2.get("fresh") and isinstance(envelope2.get("player"), dict):
-        cache_player(gid, envelope2["player"])
-        return envelope2["player"]
+    # The site refresh completed (refresh_site_player returned None), but the
+    # public API can lag the site refresh by a beat. Retry briefly for fresh data.
+    for attempt in range(1, 4):
+        envelope2 = await fetch_player_envelope(gid)
+        if isinstance(envelope2, dict) and envelope2.get("fresh") and isinstance(envelope2.get("player"), dict):
+            cache_player(gid, envelope2["player"])
+            return envelope2["player"]
+        await asyncio.sleep(1.0 if attempt == 1 else 2.0)
 
     age = envelope.get("age_seconds") or 0
     print(
@@ -640,14 +649,11 @@ async def refresh_site_alliance(
                 except json.JSONDecodeError:
                     return None
 
-            raw_alliance = data.get("alliance")
-            if isinstance(raw_alliance, dict):
-                alliance = normalize_site_alliance(raw_alliance)
-                cache_alliance(alliance, aid=aid, kid=kid, tag=tag)
-                return alliance
-
             refresh_completed = False
             if data.get("queued") or data.get("accepted") or data.get("started"):
+                # Refresh merely accepted/queued: the embedded `alliance` payload
+                # is the pre-refresh (stale) data. Poll for completion, then
+                # re-read the public API for the freshly updated power.
                 for _ in range(SITE_REFRESH_MAX_POLLS):
                     await asyncio.sleep(SITE_REFRESH_POLL_SECONDS)
                     status = await get_alliance_refresh_status(session, aid, page_url)
@@ -662,24 +668,34 @@ async def refresh_site_alliance(
                         refresh_completed = True
                         break
 
-            if refresh_completed and tag:
-                for attempt in range(1, 4):
-                    await asyncio.sleep(1.0 if attempt == 1 else 2.0)
-                    refreshed = await fetch_alliance_data(kid, tag, bypass_local_cache=True)
-                    if isinstance(refreshed, dict):
-                        refreshed["aid"] = refreshed.get("aid") or aid
-                        refreshed["kid"] = refreshed.get("kid") or kid
-                        cache_alliance(refreshed, aid=aid, kid=kid, tag=tag)
-                        print(
-                            f"[MP ALLIANCE REFRESH] aid={aid} completed; "
-                            f"public API re-read succeeded on attempt {attempt}."
-                        )
-                        return refreshed
+                if refresh_completed and tag:
+                    for attempt in range(1, 4):
+                        await asyncio.sleep(1.0 if attempt == 1 else 2.0)
+                        refreshed = await fetch_alliance_data(kid, tag, bypass_local_cache=True)
+                        if isinstance(refreshed, dict):
+                            refreshed["aid"] = refreshed.get("aid") or aid
+                            refreshed["kid"] = refreshed.get("kid") or kid
+                            cache_alliance(refreshed, aid=aid, kid=kid, tag=tag)
+                            print(
+                                f"[MP ALLIANCE REFRESH] aid={aid} completed; "
+                                f"public API re-read succeeded on attempt {attempt}."
+                            )
+                            return refreshed
 
-                print(
-                    f"[MP ALLIANCE REFRESH] aid={aid} completed, but public API "
-                    f"did not return alliance data after retries."
-                )
+                    print(
+                        f"[MP ALLIANCE REFRESH] aid={aid} completed, but public API "
+                        f"did not return alliance data after retries."
+                    )
+
+                # Refresh was pending but never completed (or re-read failed):
+                # refuse the stale embedded payload.
+                return None
+
+            raw_alliance = data.get("alliance")
+            if isinstance(raw_alliance, dict):
+                alliance = normalize_site_alliance(raw_alliance)
+                cache_alliance(alliance, aid=aid, kid=kid, tag=tag)
+                return alliance
 
             return None
 
