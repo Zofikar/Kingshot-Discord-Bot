@@ -292,21 +292,23 @@ async def setup_giftcode_auto(cog, interaction: discord.Interaction):
         color=theme.emColor1
     )
 
-    view = AllianceSelectView(alliances_with_counts, cog, context="giftcode")
-
-    view.current_select.options.insert(0, discord.SelectOption(
-        label="ENABLE ALL ALLIANCES",
-        value="enable_all",
-        description="Enable automatic redemption for all alliances",
-        emoji=f"{theme.verifiedIcon}"
-    ))
-
-    view.current_select.options.insert(1, discord.SelectOption(
-        label="DISABLE ALL ALLIANCES",
-        value="disable_all",
-        description="Disable automatic redemption for all alliances",
-        emoji=f"{theme.deniedIcon}"
-    ))
+    view = AllianceSelectView(
+        alliances_with_counts, cog, context="giftcode",
+        extra_options=[
+            discord.SelectOption(
+                label="ENABLE ALL ALLIANCES",
+                value="enable_all",
+                description="Enable automatic redemption for all alliances",
+                emoji=f"{theme.verifiedIcon}"
+            ),
+            discord.SelectOption(
+                label="DISABLE ALL ALLIANCES",
+                value="disable_all",
+                description="Disable automatic redemption for all alliances",
+                emoji=f"{theme.deniedIcon}"
+            ),
+        ]
+    )
 
     async def alliance_callback(select_interaction: discord.Interaction, alliance_id=None):
         try:

@@ -2406,12 +2406,16 @@ class AddMemberModal(discord.ui.Modal):
             )
 
 class AllianceSelectView(discord.ui.View):
-    def __init__(self, alliances_with_counts, cog=None, page=0, context="transfer"):
+    def __init__(self, alliances_with_counts, cog=None, page=0, context="transfer", extra_options=None):
         super().__init__(timeout=7200)
         self.alliances = alliances_with_counts
         self.cog = cog
         self.page = page
-        self.max_page = (len(alliances_with_counts) - 1) // 25 if alliances_with_counts else 0
+        # Reserve slots for any caller-supplied fixed options (e.g. "ALL
+        # ALLIANCES") so a page never exceeds Discord's 25-option Select limit.
+        self.extra_options = list(extra_options) if extra_options else []
+        self.page_size = max(1, 25 - len(self.extra_options))
+        self.max_page = (len(alliances_with_counts) - 1) // self.page_size if alliances_with_counts else 0
         self.current_select = None
         self.callback = None
         self.member_dict = {}
@@ -2424,11 +2428,11 @@ class AllianceSelectView(discord.ui.View):
             if isinstance(item, discord.ui.Select):
                 self.remove_item(item)
 
-        start_idx = self.page * 25
-        end_idx = min(start_idx + 25, len(self.alliances))
+        start_idx = self.page * self.page_size
+        end_idx = min(start_idx + self.page_size, len(self.alliances))
         current_alliances = self.alliances[start_idx:end_idx]
 
-        options = []
+        options = list(self.extra_options)
         for alliance_data in current_alliances:
             # Handle both 3-tuple and 4-tuple formats
             if len(alliance_data) == 4:
