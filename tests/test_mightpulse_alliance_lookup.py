@@ -398,6 +398,7 @@ class _Member:
         self.id = member_id
         self.guild = None
         self.nick = nick
+        self.bot = False
         self.roles = []
         self.nick_edits = []
 
@@ -418,17 +419,25 @@ class _Member:
 
 
 class _Guild:
-    def __init__(self, roles=(), members=()):
+    def __init__(self, roles=(), members=(), cached=True):
         self._roles = {r.id: r for r in roles}
         self._members = {m.id: m for m in members}
         self.created = []
+        self.cached = cached          # False = member cache not filled yet
         for member in self._members.values():
             member.guild = self
+
+    @property
+    def members(self):
+        return list(self._members.values())
 
     def get_role(self, role_id):
         return self._roles.get(role_id)
 
     def get_member(self, member_id):
+        return self._members.get(member_id) if self.cached else None
+
+    async def fetch_member(self, member_id):
         return self._members.get(member_id)
 
     async def create_role(self, *, name, mentionable=True, reason=None):
@@ -475,12 +484,12 @@ def _fresh(aid=AID, tag=NEW_TAG, name="theknightsONE"):
     return {"aid": aid, "abbr": tag, "name": name, "kid": KID, "power": 1858681076}
 
 
-def _renamed_cog(monkeypatch, *, rows, guild, people, fetched=None):
+def _renamed_cog(monkeypatch, *, rows, guild, people, fetched=None, nap_context=None):
     cog, upserts = _nightly_cog(
         monkeypatch,
         rows=rows,
         fetched=fetched if fetched is not None else _fresh(),
-        nap_context=lambda _bot: (nap_mod.NapLogic(), {}),
+        nap_context=nap_context or (lambda _bot: (nap_mod.NapLogic(), {})),
         linked=_wire_identity(monkeypatch, rows=rows, people=people),
     )
     cog.bot.guilds = [guild]
@@ -567,3 +576,68 @@ def test_nightly_does_not_nickname_members_without_a_tag(monkeypatch):
     asyncio.run(cog._run_nightly_maintenance(triggered_by="test"))
 
     assert frodo.nick_edits == [] and sam.nick_edits == []
+
+
+def test_nightly_retags_unlinked_members_from_the_recorded_alias(monkeypatch):
+    """Players who never linked a FID still carry the retired tag in their name.
+
+    The alias recorded when the rename was detected says `[MNX]` belonged to this
+    alliance, so the prefix is rewritten in place — the rest of the name, and the
+    member's own separator, are preserved.
+    """
+    rows = [_row(AID, NEW_TAG, role_id=ROLE_ID, name="theknightsONE")]
+    role = _Role(ROLE_ID, f"[{NEW_TAG}] theknightsONE")   # role side already fine
+    frodo = _Member(11, f"[{NEW_TAG}] Frodo")
+    gollum = _Member(98, f"[{OLD_TAG}] Gollum")           # unlinked, spaced tag
+    smeagol = _Member(99, f"[{OLD_TAG}]Smeagol")          # unlinked, no space
+    guild = _Guild([role], [frodo, gollum, smeagol])
+    aliases = {OLD_TAG: AID}
+
+    cog, _upserts = _renamed_cog(
+        monkeypatch, rows=rows, guild=guild, people=[(11, 5001, "Frodo")],
+        nap_context=lambda _bot: (nap_mod.NapLogic(nap_tag_aliases=dict(aliases)),
+                                  {"nap_tag_aliases": aliases}))
+
+    asyncio.run(cog._run_nightly_maintenance(triggered_by="test"))
+
+    assert gollum.nick == f"[{NEW_TAG}] Gollum"
+    assert smeagol.nick == f"[{NEW_TAG}]Smeagol"
+    assert frodo.nick_edits == []          # already correct -> untouched
+
+
+def test_nightly_retags_linked_member_missing_from_the_member_cache(monkeypatch):
+    """A cache miss must not leave a linked member's tag stale."""
+    rows = [_row(AID, NEW_TAG, role_id=ROLE_ID, name="theknightsONE")]
+    role = _Role(ROLE_ID, f"[{NEW_TAG}] theknightsONE")
+    frodo = _Member(11, f"[{OLD_TAG}] Frodo")
+    guild = _Guild([role], [frodo], cached=False)
+
+    cog, _upserts = _renamed_cog(
+        monkeypatch, rows=rows, guild=guild, people=[(11, 5001, "Frodo")])
+
+    asyncio.run(cog._run_nightly_maintenance(triggered_by="test"))
+
+    assert frodo.nick == f"[{NEW_TAG}] Frodo"
+
+
+def test_nightly_leaves_unknown_tags_and_bots_alone(monkeypatch):
+    """Only tags the bot can resolve are rewritten, and never for a bot user."""
+    rows = [_row(AID, NEW_TAG, role_id=ROLE_ID, name="theknightsONE")]
+    role = _Role(ROLE_ID, f"[{NEW_TAG}] theknightsONE")
+    guest = _Member(96, "[XYZ] Pippin")                 # tag nobody knows
+    sam = _Member(12, f"[{NEW_TAG}] Sam")               # already current
+    robot = _Member(97, f"[{OLD_TAG}] Robot")
+    robot.bot = True
+    guild = _Guild([role], [guest, sam, robot])
+    aliases = {OLD_TAG: AID}
+
+    cog, _upserts = _renamed_cog(
+        monkeypatch, rows=rows, guild=guild, people=[],
+        nap_context=lambda _bot: (nap_mod.NapLogic(nap_tag_aliases=dict(aliases)),
+                                  {"nap_tag_aliases": aliases}))
+
+    asyncio.run(cog._run_nightly_maintenance(triggered_by="test"))
+
+    assert guest.nick_edits == []
+    assert sam.nick_edits == []
+    assert robot.nick_edits == []

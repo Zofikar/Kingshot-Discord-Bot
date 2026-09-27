@@ -2,6 +2,7 @@
 import logging
 from datetime import time, timezone
 
+import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 from cogs.permission_handler import PermissionManager
@@ -17,9 +18,28 @@ def _settings(bot):
     return getattr(bot, "extension_settings", None) or SettingsStore()
 
 
+def _leading_tag(nick):
+    """``(tag, trailer)`` of a bot-managed ``[TAG] Name`` nickname.
+
+    ``trailer`` is everything after the closing bracket, untouched, so a rewrite
+    keeps the member's own separator (``[TAG] Name`` / ``[TAG]Name``). Returns
+    ``(None, None)`` for nicknames that carry no leading tag at all — those are
+    never touched, so a rename cannot turn into a mass re-nickname.
+    """
+    if not nick or not nick.startswith("["):
+        return None, None
+    close = nick.find("]")
+    if close <= 1:
+        return None, None
+    return nick[1:close], nick[close + 1:]
+
+
 class NightlyTasks(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        # Last `_sync_alliance_discord_state` counts, so /admin_nightly_refresh can
+        # report what actually reached Discord.
+        self.last_tag_sync = {"linked": 0, "retagged": 0}
 
     async def cog_load(self):
         if mightpulse.available():
@@ -133,6 +153,17 @@ class NightlyTasks(commands.Cog):
         re-applying every player right after its alliance snapshot changes; here
         we reconcile the alliances whose Discord state drifted.
 
+        Two passes per guild:
+
+        1. linked members — for every tracked alliance, rename the role and hand
+           the members whose nickname carries a stale tag back to ``sync_member``
+           (authoritative: name + roles come from their MightPulse snapshot);
+        2. everyone else — a member who never linked a FID still advertises the
+           retired tag in their nickname, and no amount of storage lookups will
+           find them. If that tag is one we know (a tracked alliance's current
+           tag, or a historical alias recorded when the rename was detected) the
+           nickname's tag is rewritten in place, keeping the rest of the name.
+
         Idempotent: a role whose name already matches and members whose nickname
         already carries the current tag are left untouched.
 
@@ -140,25 +171,70 @@ class NightlyTasks(commands.Cog):
         """
         from ..cogs.identity import _ensure_alliance_role, sync_member
 
+        rows = [row for row in storage.all_alliances() if row["role_id"] and row["abbr"]]
+        if not rows:
+            return 0
+        # Exact-case keys: MNX (main) and MNx (academy) are different alliances.
+        abbr_by_aid = {str(row["alliance_id"]): row["abbr"] for row in rows}
+        current_tags = {str(row["abbr"]): row["abbr"] for row in rows}
+        aliases = None            # lazily read NAP state: no DB read when unused
+
         resynced = 0
+        retagged = 0
         for guild in list(getattr(self.bot, "guilds", None) or []):
-            for row in storage.all_alliances():
-                aid = row["alliance_id"]
+            touched = set()
+            for row in rows:
                 abbr = row["abbr"]
-                # Metadata-only rows (no role yet, e.g. NAP discovery) have no
-                # Discord state to fix; a role is created on first registration.
-                if not row["role_id"] or not abbr:
-                    continue
+                aid = row["alliance_id"]
                 expected = f"[{abbr}] {row['name'] or abbr}"[:100]
                 role = guild.get_role(int(row["role_id"]))
-                stale = self._stale_tagged(self._linked_members(guild, aid), abbr)
+                stale = self._stale_tagged(await self._linked_members(guild, aid), abbr)
                 if role is not None and role.name == expected and not stale:
                     continue
                 await _ensure_alliance_role(self.bot, guild, aid)
                 for member in stale:
                     await sync_member(self.bot, member)
+                    touched.add(member.id)
                     resynced += 1
+            for member in list(getattr(guild, "members", None) or []):
+                if member.id in touched or getattr(member, "bot", False):
+                    continue
+                tag, trailer = _leading_tag(getattr(member, "nick", None))
+                if tag is None or tag in current_tags:
+                    continue
+                if aliases is None:
+                    aliases = self._alias_targets(abbr_by_aid)
+                target = aliases.get(tag)
+                if target is None or target == tag:
+                    continue
+                try:
+                    await member.edit(nick=f"[{target}]{trailer}"[:32],
+                                      reason="Alliance rename sync")
+                except (discord.Forbidden, discord.HTTPException) as e:
+                    logger.warning("Could not re-tag member %s: %s", member.id, e)
+                    continue
+                retagged += 1
+        if resynced or retagged:
+            logger.info(
+                "Alliance tag sync: %s linked member(s) re-applied, %s stale tag(s) rewritten.",
+                resynced, retagged)
+        self.last_tag_sync = {"linked": resynced, "retagged": retagged}
         return resynced
+
+    def _alias_targets(self, abbr_by_aid) -> dict:
+        """{retired tag: that alliance's current abbr} from the recorded aliases."""
+        from ..cogs.nap import _nap_context
+        try:
+            logic, _state = _nap_context(self.bot)
+        except Exception as e:
+            logger.warning("Could not read tag aliases for the Discord re-tag: %s", e)
+            return {}
+        targets = {}
+        for tag, aid in (logic.nap_tag_aliases or {}).items():
+            abbr = abbr_by_aid.get(str(aid))
+            if abbr:
+                targets.setdefault(str(tag), abbr)
+        return targets
 
     @staticmethod
     def _stale_tagged(members, abbr) -> list:
@@ -168,16 +244,29 @@ class NightlyTasks(commands.Cog):
         no nickname, or one without a tag, is deliberately left alone so a rename
         cannot turn into a mass re-nickname of people who never opted in.
         """
-        prefix = f"[{abbr}]"
-        return [m for m in members
-                if (m.nick or "").startswith("[") and not m.nick.startswith(prefix)]
+        stale = []
+        for member in members:
+            tag, _trailer = _leading_tag(getattr(member, "nick", None))
+            if tag is not None and tag != abbr:
+                stale.append(member)
+        return stale
 
-    @staticmethod
-    def _linked_members(guild, aid) -> list:
-        """Online members owning any FID in this alliance (main account drives)."""
+    async def _linked_members(self, guild, aid) -> list:
+        """Members owning any FID in this alliance (cache first, then a fetch)."""
         members = []
         for discord_id in storage.discord_ids_for_alliances([aid]):
-            member = guild.get_member(discord_id)
+            try:
+                member = guild.get_member(int(discord_id))
+            except (TypeError, ValueError):
+                continue
+            if member is None:
+                # Not in the member cache (big guild, no chunk yet): ask directly
+                # instead of skipping, otherwise those tags silently stay stale.
+                try:
+                    member = await guild.fetch_member(int(discord_id))
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+                    logger.debug("Could not fetch linked member %s: %s", discord_id, e)
+                    continue
             if member is not None:
                 members.append(member)
         return members
@@ -201,4 +290,10 @@ class NightlyTasks(commands.Cog):
         except Exception as e:
             await interaction.followup.send(f"Nightly maintenance failed: {e}", ephemeral=True)
             return
-        await interaction.followup.send("Nightly maintenance finished.", ephemeral=True)
+        sync = self.last_tag_sync
+        await interaction.followup.send(
+            "Nightly maintenance finished.\n"
+            f"Discord tag sync: {sync['linked']} linked member(s) re-applied, "
+            f"{sync['retagged']} stale tag(s) rewritten "
+            f"(alliances tracked: {len(storage.all_alliances())}).",
+            ephemeral=True)
