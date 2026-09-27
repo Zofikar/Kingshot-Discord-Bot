@@ -115,7 +115,72 @@ class NightlyTasks(commands.Cog):
                     aid, abbr=new_tag or tag, name=alliance.get("name") or tag,
                     kid=alliance.get("kid") or kid, power=alliance.get("power"),
                 )
-            logger.info("Nightly maintenance done (trigger=%s, discovered=%s)", triggered_by, discovered)
+            # The rows above are fresh; make Discord agree with them (role names
+            # and every member's `[TAG]` nickname prefix).
+            resynced = await self._sync_alliance_discord_state()
+            logger.info(
+                "Nightly maintenance done (trigger=%s, discovered=%s, members_resynced=%s)",
+                triggered_by, discovered, resynced)
+
+    async def _sync_alliance_discord_state(self) -> int:
+        """Re-tag alliance roles + member nicknames from the stored alliance rows.
+
+        The refresh above only rewrites ``alliance_list``. Discord state (the
+        ``[TAG] Name`` role and the ``[TAG]`` nickname prefix) was previously
+        touched only when a member ran /register or /refresh, so a renamed
+        alliance (MNX -> TKO) kept its retired tag on its role and on every
+        member who did not happen to re-sync. The monolith avoids this by
+        re-applying every player right after its alliance snapshot changes; here
+        we reconcile the alliances whose Discord state drifted.
+
+        Idempotent: a role whose name already matches and members whose nickname
+        already carries the current tag are left untouched.
+
+        Returns the number of members re-applied.
+        """
+        from ..cogs.identity import _ensure_alliance_role, sync_member
+
+        resynced = 0
+        for guild in list(getattr(self.bot, "guilds", None) or []):
+            for row in storage.all_alliances():
+                aid = row["alliance_id"]
+                abbr = row["abbr"]
+                # Metadata-only rows (no role yet, e.g. NAP discovery) have no
+                # Discord state to fix; a role is created on first registration.
+                if not row["role_id"] or not abbr:
+                    continue
+                expected = f"[{abbr}] {row['name'] or abbr}"[:100]
+                role = guild.get_role(int(row["role_id"]))
+                stale = self._stale_tagged(self._linked_members(guild, aid), abbr)
+                if role is not None and role.name == expected and not stale:
+                    continue
+                await _ensure_alliance_role(self.bot, guild, aid)
+                for member in stale:
+                    await sync_member(self.bot, member)
+                    resynced += 1
+        return resynced
+
+    @staticmethod
+    def _stale_tagged(members, abbr) -> list:
+        """Members whose nickname carries an alliance tag that is no longer theirs.
+
+        Only *tagged* nicknames are considered (``[XYZ] Name``); a member who has
+        no nickname, or one without a tag, is deliberately left alone so a rename
+        cannot turn into a mass re-nickname of people who never opted in.
+        """
+        prefix = f"[{abbr}]"
+        return [m for m in members
+                if (m.nick or "").startswith("[") and not m.nick.startswith(prefix)]
+
+    @staticmethod
+    def _linked_members(guild, aid) -> list:
+        """Online members owning any FID in this alliance (main account drives)."""
+        members = []
+        for discord_id in storage.discord_ids_for_alliances([aid]):
+            member = guild.get_member(discord_id)
+            if member is not None:
+                members.append(member)
+        return members
 
     async def _post_nap_ranking(self, *, triggered_by="scheduler"):
         from ..cogs.nap import post_nap_ranking

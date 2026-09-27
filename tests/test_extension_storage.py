@@ -58,3 +58,16 @@ def test_all_alliance_role_ids(tmp_path):
     storage.upsert_alliance(2, role_id=102, db_dir=db)
     assert sorted(storage.all_alliance_role_ids(db_dir=db)) == [101, 102]
 
+
+def test_discord_ids_for_alliances_matches_linked_fids(tmp_path):
+    """Drives the post-rename re-tagging of members."""
+    db = str(tmp_path)
+    storage.register_player(fid=100, discord_id=111, alliance_aid=7, abbr="XYZ", db_dir=db)
+    storage.register_player(fid=200, discord_id=222, alliance_aid=8, abbr="ABC", db_dir=db)
+    storage.register_player(fid=300, discord_id=None, alliance_aid=7, db_dir=db)
+
+    assert storage.discord_ids_for_alliances([7], db_dir=db) == [111]
+    assert sorted(storage.discord_ids_for_alliances([7, "8"], db_dir=db)) == [111, 222]
+    assert storage.discord_ids_for_alliances([], db_dir=db) == []
+    assert storage.discord_ids_for_alliances([999], db_dir=db) == []
+

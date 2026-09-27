@@ -240,6 +240,7 @@ class _Settings:
 class _Bot:
     def __init__(self):
         self.maintenance_lock = asyncio.Lock()
+        self.guilds = []
         self.extension_settings = _Settings(
             {"whitelist_kids": [KID], "nap_alliances_count": 20})
 
@@ -254,12 +255,12 @@ class _SaveRecorder:
         _SaveRecorder.saved.append(data)
 
 
-def _row(aid, abbr, kid=KID):
-    return {"alliance_id": aid, "abbr": abbr, "kid": kid, "power": 1, "name": "n",
-            "role_id": None}
+def _row(aid, abbr, kid=KID, *, role_id=None, name="n"):
+    return {"alliance_id": aid, "abbr": abbr, "kid": kid, "power": 1, "name": name,
+            "role_id": role_id}
 
 
-def _nightly_cog(monkeypatch, *, rows, fetched, nap_context, rows_fn=None):
+def _nightly_cog(monkeypatch, *, rows, fetched, nap_context, rows_fn=None, linked=None):
     """A NightlyTasks cog with storage/provider/Discord side effects captured."""
     cog = nightly_mod.NightlyTasks(_Bot())
 
@@ -276,6 +277,8 @@ def _nightly_cog(monkeypatch, *, rows, fetched, nap_context, rows_fn=None):
                         rows_fn or (lambda: rows))
     monkeypatch.setattr(nightly_mod.storage, "upsert_alliance",
                         lambda aid, **kw: upserts.append((aid, kw)))
+    monkeypatch.setattr(nightly_mod.storage, "discord_ids_for_alliances",
+                        linked or (lambda aids: []))
     monkeypatch.setattr(nightly_mod.storage, "Storage", _SaveRecorder)
     monkeypatch.setattr(nap_cog, "_nap_context", nap_context)
     _SaveRecorder.saved = []
@@ -369,3 +372,198 @@ def test_nightly_keeps_previous_values_on_failed_refresh(monkeypatch):
     asyncio.run(cog._run_nightly_maintenance(triggered_by="test"))
 
     assert upserts == []
+
+
+# ── Discord side of a rename: role name + member `[TAG]` prefixes ───────────
+
+ROLE_ID = 777700
+
+
+class _Role:
+    def __init__(self, role_id, name):
+        self.id = role_id
+        self.name = name
+        self.position = 5
+        self.renames = []
+
+    async def edit(self, *, name=None, reason=None):
+        self.renames.append(name)
+        if name is not None:
+            self.name = name
+        return self
+
+
+class _Member:
+    def __init__(self, member_id, nick):
+        self.id = member_id
+        self.guild = None
+        self.nick = nick
+        self.roles = []
+        self.nick_edits = []
+
+    async def add_roles(self, *roles, reason=None):
+        for role in roles:
+            if role not in self.roles:
+                self.roles.append(role)
+
+    async def remove_roles(self, *roles, reason=None):
+        for role in roles:
+            if role in self.roles:
+                self.roles.remove(role)
+
+    async def edit(self, *, nick=None, reason=None):
+        self.nick_edits.append(nick)
+        if nick is not None:
+            self.nick = nick
+
+
+class _Guild:
+    def __init__(self, roles=(), members=()):
+        self._roles = {r.id: r for r in roles}
+        self._members = {m.id: m for m in members}
+        self.created = []
+        for member in self._members.values():
+            member.guild = self
+
+    def get_role(self, role_id):
+        return self._roles.get(role_id)
+
+    def get_member(self, member_id):
+        return self._members.get(member_id)
+
+    async def create_role(self, *, name, mentionable=True, reason=None):
+        role = _Role(max(self._roles, default=0) + 1000, name)
+        self._roles[role.id] = role
+        self.created.append(role)
+        return role
+
+
+def _wire_identity(monkeypatch, *, rows, people):
+    """Point the identity cog's storage reads at the fake guild fixtures.
+
+    ``people`` = [(discord_id, fid, in-game name), ...]; every fid belongs to the
+    first ``rows`` entry's alliance. Returns the ``discord_ids_for_alliances``
+    stand-in for the nightly task.
+    """
+    from extension.cogs import identity as identity_mod
+
+    by_aid = {str(r["alliance_id"]): r for r in rows}
+    aid = rows[0]["alliance_id"]
+    fid_aid = {fid: aid for _did, fid, _name in people}
+    fid_name = {fid: name for _did, fid, name in people}
+    discord_fid = {did: fid for did, fid, _name in people}
+
+    monkeypatch.setattr(identity_mod.storage, "alliance_row",
+                        lambda aid_: by_aid.get(str(aid_)))
+    monkeypatch.setattr(identity_mod.storage, "user_row",
+                        lambda fid: {"nickname": fid_name.get(fid), "rank": 3,
+                                     "alliance": fid_aid.get(fid)})
+    monkeypatch.setattr(identity_mod.storage, "main_fid_for_discord",
+                        lambda did: discord_fid.get(did))
+    monkeypatch.setattr(identity_mod.storage, "top_alliances_by_power", lambda n: [])
+    monkeypatch.setattr(identity_mod.storage, "all_alliance_role_ids",
+                        lambda: [r["role_id"] for r in rows if r["role_id"]])
+
+    def _linked(aids):
+        wanted = {str(a) for a in aids}
+        return [did for did, fid, _name in people if str(fid_aid[fid]) in wanted]
+
+    return _linked
+
+
+def _fresh(aid=AID, tag=NEW_TAG, name="theknightsONE"):
+    return {"aid": aid, "abbr": tag, "name": name, "kid": KID, "power": 1858681076}
+
+
+def _renamed_cog(monkeypatch, *, rows, guild, people, fetched=None):
+    cog, upserts = _nightly_cog(
+        monkeypatch,
+        rows=rows,
+        fetched=fetched if fetched is not None else _fresh(),
+        nap_context=lambda _bot: (nap_mod.NapLogic(), {}),
+        linked=_wire_identity(monkeypatch, rows=rows, people=people),
+    )
+    cog.bot.guilds = [guild]
+    return cog, upserts
+
+
+def test_nightly_renames_alliance_role_and_member_tags(monkeypatch):
+    """MNX -> TKO must reach Discord: role name *and* every member's prefix."""
+    rows = [_row(AID, NEW_TAG, role_id=ROLE_ID, name="theknightsONE")]
+    role = _Role(ROLE_ID, f"[{OLD_TAG}] FAMILLY")     # what Discord still shows
+    frodo = _Member(11, f"[{OLD_TAG}] Frodo")         # stale tag in his name
+    sam = _Member(12, f"[{NEW_TAG}] Sam")             # already re-tagged
+    guild = _Guild([role], [frodo, sam])
+
+    cog, _upserts = _renamed_cog(
+        monkeypatch, rows=rows, guild=guild,
+        people=[(11, 5001, "Frodo"), (12, 5002, "Sam")])
+
+    asyncio.run(cog._run_nightly_maintenance(triggered_by="test"))
+
+    assert role.name == f"[{NEW_TAG}] theknightsONE"
+    assert role.renames == [f"[{NEW_TAG}] theknightsONE"]
+    assert frodo.nick == f"[{NEW_TAG}] Frodo"
+    assert frodo.nick_edits == [f"[{NEW_TAG}] Frodo"]
+    assert frodo.roles == [role]        # the alliance role is re-applied
+    assert sam.nick_edits == []         # already tagged -> untouched
+
+
+def test_nightly_fixes_member_tags_when_only_they_lagged(monkeypatch):
+    """A member who re-synced early renames the role; the rest still need a fix."""
+    rows = [_row(AID, NEW_TAG, role_id=ROLE_ID, name="theknightsONE")]
+    role = _Role(ROLE_ID, f"[{NEW_TAG}] theknightsONE")   # role already correct
+    frodo = _Member(11, f"[{OLD_TAG}] Frodo")             # ...but his tag is not
+    guild = _Guild([role], [frodo])
+
+    cog, _upserts = _renamed_cog(
+        monkeypatch, rows=rows, guild=guild, people=[(11, 5001, "Frodo")])
+
+    asyncio.run(cog._run_nightly_maintenance(triggered_by="test"))
+
+    assert frodo.nick == f"[{NEW_TAG}] Frodo"
+    assert role.renames == []           # no pointless second rename
+
+
+def test_nightly_discord_sync_is_idempotent(monkeypatch):
+    rows = [_row(AID, NEW_TAG, role_id=ROLE_ID, name="theknightsONE")]
+    role = _Role(ROLE_ID, f"[{NEW_TAG}] theknightsONE")
+    frodo = _Member(11, f"[{NEW_TAG}] Frodo")
+    guild = _Guild([role], [frodo])
+
+    cog, _upserts = _renamed_cog(
+        monkeypatch, rows=rows, guild=guild, people=[(11, 5001, "Frodo")])
+
+    asyncio.run(cog._run_nightly_maintenance(triggered_by="test"))
+
+    assert role.renames == [] and frodo.nick_edits == [] and guild.created == []
+
+
+def test_nightly_leaves_metadata_only_alliances_alone(monkeypatch):
+    """Discovery rows without a role (nobody registered yet) create no role."""
+    rows = [_row(AID, OLD_TAG, role_id=None)]
+    guild = _Guild()
+
+    cog, _upserts = _renamed_cog(
+        monkeypatch, rows=rows, guild=guild, people=[(11, 5001, "Frodo")])
+
+    asyncio.run(cog._run_nightly_maintenance(triggered_by="test"))
+
+    assert guild.created == []
+
+
+def test_nightly_does_not_nickname_members_without_a_tag(monkeypatch):
+    """Only nicknames already carrying a stale tag are touched (no mass renames)."""
+    rows = [_row(AID, NEW_TAG, role_id=ROLE_ID, name="theknightsONE")]
+    role = _Role(ROLE_ID, f"[{NEW_TAG}] theknightsONE")   # nothing left to rename
+    frodo = _Member(11, "Frodo")                          # plain nickname
+    sam = _Member(12, None)                               # no nickname at all
+    guild = _Guild([role], [frodo, sam])
+
+    cog, _upserts = _renamed_cog(
+        monkeypatch, rows=rows, guild=guild,
+        people=[(11, 5001, "Frodo"), (12, 5002, "Sam")])
+
+    asyncio.run(cog._run_nightly_maintenance(triggered_by="test"))
+
+    assert frodo.nick_edits == [] and sam.nick_edits == []

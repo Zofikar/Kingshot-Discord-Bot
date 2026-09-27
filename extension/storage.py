@@ -328,6 +328,25 @@ def main_fid_for_discord(discord_id: int, *, db_dir: str = "db"):
     return fids[0][0] if fids else None
 
 
+def discord_ids_for_alliances(aids, *, db_dir: str = "db") -> list:
+    """Distinct Discord user ids owning any FID in one of these alliances.
+
+    Used to re-tag members after an alliance rename (the ``nickname`` prefix and
+    the alliance role are derived from the alliance's current tag).
+    """
+    keys = [str(a) for a in aids if a not in (None, "")]
+    if not keys:
+        return []
+    marks = ",".join("?" for _ in keys)
+    with _connect(os.path.join(db_dir, USERS_FILE)) as conn:
+        rows = conn.execute(
+            f"SELECT DISTINCT discord_id FROM users WHERE discord_id IS NOT NULL "
+            f"AND CAST(alliance AS TEXT) IN ({marks})",
+            keys,
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
 def user_row(fid, *, db_dir: str = "db"):
     """Full users row for a FID (sqlite3.Row) or None."""
     with _connect(os.path.join(db_dir, USERS_FILE)) as conn:
