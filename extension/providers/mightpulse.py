@@ -512,6 +512,71 @@ async def fetch_alliance_data(
         return None
 
 
+async def fetch_alliance_by_aid(
+        aid: int,
+        *,
+        bypass_local_cache: bool = False,
+) -> dict | None:
+    """Fetch alliance info by *alliance id* from the public MightPulse API.
+
+    Tag-keyed reads (``/v1/alliances/{kid}/{tag}``) return
+    ``{"ok": false, "error": "alliance_not_found"}`` as soon as an alliance
+    renames, because the stored tag no longer exists. Alliance ids never change,
+    so this endpoint keeps working across renames and also reports the current
+    tag/name (used to detect the rename and record a historical tag alias).
+    """
+    if not bypass_local_cache:
+        cached = get_cached_alliance(aid=aid)
+        if cached:
+            print(f"[LOCAL CACHE] alliance aid={aid} HIT")
+            return cached
+
+    print(f"[LOCAL CACHE] alliance aid={aid} MISS")
+    url = f"https://api.mightpulse.com/v1/alliances/{int(aid)}?include=info"
+    headers = {"Authorization": f"Bearer {_config.api_key}"}
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    alliance = data.get("alliance") if data.get("ok") else None
+                    if isinstance(alliance, dict):
+                        # The per-aid envelope carries kid/aid/tag outside the
+                        # nested alliance object; keep them on the payload so
+                        # callers can persist/compare them.
+                        if alliance.get("aid") is None:
+                            alliance["aid"] = data.get("aid")
+                        if alliance.get("kid") is None:
+                            alliance["kid"] = data.get("kid")
+                        if alliance.get("abbr") is None:
+                            alliance["abbr"] = data.get("tag")
+                        cache_alliance(alliance, aid=aid, kid=data.get("kid"))
+                    return alliance
+                body = await resp.text()
+                print(f"[MIGHTPULSE] Alliance GET HTTP {resp.status} for aid={aid}: {body[:500]}")
+                return None
+    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+        print(f"[MIGHTPULSE] Alliance GET failed for aid={aid}: {e}")
+        return None
+
+
+async def read_official_alliance(aid: int, *, kid: int | None = None, tag: str | None = None) -> dict | None:
+    """Aid-first official-API read, falling back to the legacy tag route.
+
+    The id lookup is authoritative and rename-proof; the tag lookup only stays
+    as a fallback for entries that predate the id endpoint.
+    """
+    alliance = await fetch_alliance_by_aid(aid, bypass_local_cache=True)
+    if isinstance(alliance, dict):
+        return alliance
+    if tag and kid:
+        alliance = await fetch_alliance_data(int(kid), tag, bypass_local_cache=True)
+        if isinstance(alliance, dict):
+            return alliance
+    return None
+
+
 async def get_alliance_refresh_status(session, aid: int, referer: str) -> dict | None:
     url = f"{MIGHTPULSE_SITE_BASE}/api/alliances/{aid}/refresh/status"
     try:
@@ -545,12 +610,18 @@ async def fetch_current_alliance(
         kid: int,
         tag: str | None,
 ) -> tuple[dict | None, str]:
-    """Get current alliance data without needlessly forcing a fresh refresh."""
-    if not tag:
-        print(f"[MP ALLIANCE CURRENT] aid={aid} has no tag; cannot query official alliance API")
-        return None, "missing-tag"
+    """Get current alliance data without needlessly forcing a fresh refresh.
 
-    page_url = f"{MIGHTPULSE_SITE_BASE}/{kid}/{tag}"
+    Every read goes through the alliance id (``read_official_alliance``); a tag
+    is only used for the website page/referer. This keeps renamed alliances
+    updating instead of failing with ``alliance_not_found`` on their old tag.
+
+    Status-first policy:
+      recent/running -> official API
+      stale          -> force website refresh
+      status unknown -> official API first, then forced refresh as fallback
+    """
+    page_url = f"{MIGHTPULSE_SITE_BASE}/{kid}/{tag}" if tag else f"{MIGHTPULSE_SITE_BASE}/{kid}"
     timeout = aiohttp.ClientTimeout(total=120)
     cookie_jar = aiohttp.CookieJar(unsafe=True)
 
@@ -571,13 +642,13 @@ async def fetch_current_alliance(
         )
 
         if state in ("recent", "running"):
-            alliance = await fetch_alliance_data(kid, tag, bypass_local_cache=True)
+            alliance = await read_official_alliance(aid, kid=kid, tag=tag)
             return alliance, f"official-api-{state}"
 
         alliance = await refresh_site_alliance(aid, force=True, tag=tag, bypass_local_cache=True)
         return alliance, "site-refresh"
 
-    alliance = await fetch_alliance_data(kid, tag, bypass_local_cache=True)
+    alliance = await read_official_alliance(aid, kid=kid, tag=tag)
     if isinstance(alliance, dict):
         return alliance, "official-api-status-unknown"
 
@@ -663,10 +734,13 @@ async def refresh_site_alliance(
                         refresh_completed = True
                         break
 
-                if refresh_completed and tag:
+                if refresh_completed:
+                    # Re-read by alliance id: the stored tag is exactly what may
+                    # have changed, so a tag-keyed re-read would 404 and throw
+                    # away the freshly refreshed data.
                     for attempt in range(1, 4):
                         await asyncio.sleep(1.0 if attempt == 1 else 2.0)
-                        refreshed = await fetch_alliance_data(kid, tag, bypass_local_cache=True)
+                        refreshed = await read_official_alliance(aid, kid=kid, tag=tag)
                         if isinstance(refreshed, dict):
                             refreshed["aid"] = refreshed.get("aid") or aid
                             refreshed["kid"] = refreshed.get("kid") or kid

@@ -74,19 +74,47 @@ class NightlyTasks(commands.Cog):
 
     async def _run_nightly_maintenance(self, *, triggered_by="scheduler"):
         async with self.bot.maintenance_lock:
+            # Historical tag -> aid aliases so a renamed alliance stays resolvable
+            # (lookback protection, /admin_academy_set, exclusions) exactly like
+            # the monolith's nightly loop. The tags are snapshotted *before*
+            # discovery, because discovery already rewrites `abbr` from the live
+            # kingdom board and would otherwise hide the rename. NAP state is
+            # loaded lazily: no DB read at all when nothing was renamed.
+            previous_tags = {row["alliance_id"]: row["abbr"] for row in storage.all_alliances()}
+            rename_state = None
             discovered = await self._discover_candidates()
             for row in storage.all_alliances():
                 aid = row["alliance_id"]
                 tag = row["abbr"]
                 kid = row["kid"] or await self._primary_kid()
-                if not tag or not kid:
+                # No stored tag is fine now: the refresh is keyed on the alliance
+                # id, which is what survives a rename.
+                if not kid:
                     continue
-                alliance, _source = await mightpulse.fetch_current_alliance(int(aid), kid=int(kid), tag=tag)
-                if isinstance(alliance, dict):
-                    storage.upsert_alliance(
-                        aid, abbr=alliance.get("abbr") or tag, name=alliance.get("name") or tag,
-                        kid=alliance.get("kid") or kid, power=alliance.get("power"),
-                    )
+                alliance, source = await mightpulse.fetch_current_alliance(
+                    int(aid), kid=int(kid), tag=tag)
+                if not isinstance(alliance, dict):
+                    logger.warning(
+                        "Alliance update failed for aid=%s tag=%r source=%s; keeping previous snapshot value.",
+                        aid, tag, source)
+                    continue
+                new_tag = alliance.get("abbr")
+                old_tag = previous_tags.get(aid) or tag
+                if new_tag and old_tag and str(old_tag).strip().upper() != str(new_tag).strip().upper():
+                    if rename_state is None:
+                        from ..cogs.nap import _nap_context
+                        rename_state = _nap_context(self.bot)
+                    logic, nap_state = rename_state
+                    if logic.record_tag_alias(old_tag, aid):
+                        nap_state["nap_tag_aliases"] = logic.nap_tag_aliases
+                        storage.Storage().save(nap_state)
+                    logger.info(
+                        "Alliance aid=%s renamed [%s] -> [%s]; alias recorded.",
+                        aid, old_tag, new_tag)
+                storage.upsert_alliance(
+                    aid, abbr=new_tag or tag, name=alliance.get("name") or tag,
+                    kid=alliance.get("kid") or kid, power=alliance.get("power"),
+                )
             logger.info("Nightly maintenance done (trigger=%s, discovered=%s)", triggered_by, discovered)
 
     async def _post_nap_ranking(self, *, triggered_by="scheduler"):
