@@ -30,7 +30,9 @@ class NightlyTasks(commands.Cog):
         self.daily_alliance_maintenance.cancel()
         self.daily_nap_post.cancel()
 
-    @tasks.loop(time=time(hour=0, minute=30, second=0, tzinfo=timezone.utc))
+    # Runs before the 00:05 NAP post (same order as the monolith) so the daily
+    # post always reflects the freshly rebuilt ranking snapshot.
+    @tasks.loop(time=time(hour=0, minute=0, second=30, tzinfo=timezone.utc))
     async def daily_alliance_maintenance(self):
         await self.bot.wait_until_ready()
         try:
@@ -71,20 +73,21 @@ class NightlyTasks(commands.Cog):
         return min(len(candidates), candidate_count)
 
     async def _run_nightly_maintenance(self, *, triggered_by="scheduler"):
-        discovered = await self._discover_candidates()
-        for row in storage.all_alliances():
-            aid = row["alliance_id"]
-            tag = row["abbr"]
-            kid = row["kid"] or await self._primary_kid()
-            if not tag or not kid:
-                continue
-            alliance, _source = await mightpulse.fetch_current_alliance(int(aid), kid=int(kid), tag=tag)
-            if isinstance(alliance, dict):
-                storage.upsert_alliance(
-                    aid, abbr=alliance.get("abbr") or tag, name=alliance.get("name") or tag,
-                    kid=alliance.get("kid") or kid, power=alliance.get("power"),
-                )
-        logger.info("Nightly maintenance done (trigger=%s, discovered=%s)", triggered_by, discovered)
+        async with self.bot.maintenance_lock:
+            discovered = await self._discover_candidates()
+            for row in storage.all_alliances():
+                aid = row["alliance_id"]
+                tag = row["abbr"]
+                kid = row["kid"] or await self._primary_kid()
+                if not tag or not kid:
+                    continue
+                alliance, _source = await mightpulse.fetch_current_alliance(int(aid), kid=int(kid), tag=tag)
+                if isinstance(alliance, dict):
+                    storage.upsert_alliance(
+                        aid, abbr=alliance.get("abbr") or tag, name=alliance.get("name") or tag,
+                        kid=alliance.get("kid") or kid, power=alliance.get("power"),
+                    )
+            logger.info("Nightly maintenance done (trigger=%s, discovered=%s)", triggered_by, discovered)
 
     async def _post_nap_ranking(self, *, triggered_by="scheduler"):
         from ..cogs.nap import post_nap_ranking
@@ -95,6 +98,9 @@ class NightlyTasks(commands.Cog):
         await interaction.response.defer(ephemeral=True)
         if not PermissionManager.is_admin(interaction.user.id)[0]:
             await interaction.followup.send("You don't have admin permission.", ephemeral=True)
+            return
+        if self.bot.maintenance_lock.locked():
+            await interaction.followup.send("⚠️ Nightly maintenance is already running.", ephemeral=True)
             return
         await interaction.followup.send("Starting nightly maintenance...", ephemeral=True)
         try:

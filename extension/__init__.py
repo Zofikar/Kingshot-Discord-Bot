@@ -9,6 +9,7 @@ The ``setup`` entrypoint wires the pieces in order:
     config -> providers -> settings -> storage -> cogs -> tasks
 """
 
+import asyncio
 import logging
 import os
 
@@ -44,6 +45,11 @@ async def setup(bot):
 
     bot.extension_config = cfg
     bot.extension_settings = settings
+
+    # Shared lock so the nightly maintenance and the NAP ranking post never run
+    # concurrently (mirrors the monolith's ``maintenance_lock``). The post waits
+    # for a rebuild to finish, so it always reads the completed snapshot.
+    bot.maintenance_lock = asyncio.Lock()
 
     # Load the identity cogs, overriding upstream /unregister (always) and
     # /register (only when MightPulse is configured).

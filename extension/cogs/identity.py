@@ -317,7 +317,7 @@ class IdentityMightpulse(commands.Cog):
     async def register(self, interaction, gid: str):
         await interaction.response.defer(ephemeral=True)
         settings = _settings(self.bot)
-        player = await mightpulse.fetch_player_data(gid)
+        player = await mightpulse.fetch_player_data(gid, force_refresh=True)
         if not isinstance(player, dict):
             reason = _LOOKUP_ERRORS.get(player, "could not be refreshed")
             await interaction.followup.send(f"That ID {reason}.", ephemeral=True)
@@ -349,7 +349,7 @@ class IdentityMightpulse(commands.Cog):
         if fid is None:
             await interaction.followup.send("You have no linked account to refresh.", ephemeral=True)
             return
-        player = await mightpulse.fetch_player_data(fid)
+        player = await mightpulse.fetch_player_data(fid, force_refresh=True)
         if not isinstance(player, dict):
             reason = _LOOKUP_ERRORS.get(player, "could not be refreshed")
             await interaction.followup.send(f"Could not refresh: {reason}.", ephemeral=True)
@@ -372,7 +372,7 @@ class IdentityMightpulse(commands.Cog):
             await interaction.followup.send("You don't have admin permission.", ephemeral=True)
             return
         settings = _settings(self.bot)
-        player = await mightpulse.fetch_player_data(gid)
+        player = await mightpulse.fetch_player_data(gid, force_refresh=True)
         if not isinstance(player, dict):
             reason = _LOOKUP_ERRORS.get(player, "could not be refreshed")
             await interaction.followup.send(f"That ID {reason}.", ephemeral=True)
@@ -406,7 +406,7 @@ class IdentityMightpulse(commands.Cog):
         if fid is None:
             await interaction.followup.send(f"{member.mention} has no linked account.", ephemeral=True)
             return
-        player = await mightpulse.fetch_player_data(fid)
+        player = await mightpulse.fetch_player_data(fid, force_refresh=True)
         if isinstance(player, dict):
             fields = roles.player_to_user_fields(fid, player)
             storage.register_player(

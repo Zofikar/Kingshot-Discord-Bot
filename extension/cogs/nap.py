@@ -49,7 +49,7 @@ def _save_nap(logic, nap_state):
 
 async def _resolve_aid_from_gid(gid):
     """Resolve an alliance aid from a member GID (or return an error string)."""
-    player = await mightpulse.fetch_player_data(gid)
+    player = await mightpulse.fetch_player_data(gid, force_refresh=True)
     if not isinstance(player, dict):
         return f"Could not fetch Governor ID `{gid}`."
     alliance = player.get("alliance") or {}
@@ -63,46 +63,49 @@ async def _resolve_aid_from_gid(gid):
 
 async def post_nap_ranking(bot, *, triggered_by="scheduler"):
     """Post the NAP ranking (+ lookback footer) and the leaders tag list. Returns bool."""
-    settings = _settings(bot)
-    channel_id = settings.get_int("nap_channel_id")
-    if not channel_id:
-        return False
-    logic, _ = _nap_context(bot)
-    ranking = await logic.get_nap_ranking()
-    if not ranking:
-        return False
+    # Wait for any in-progress nightly maintenance so the posted snapshot always
+    # reflects the completed persisted ranking state (mirrors the monolith's lock).
+    async with bot.maintenance_lock:
+        settings = _settings(bot)
+        channel_id = settings.get_int("nap_channel_id")
+        if not channel_id:
+            return False
+        logic, _ = _nap_context(bot)
+        ranking = await logic.get_nap_ranking()
+        if not ranking:
+            return False
 
-    academy_tags = {}
-    for main_key, academy_val in logic.academies.items():
-        ac_tag = logic.get_tag_for_aid(academy_val)
-        if ac_tag:
-            academy_tags[str(main_key)] = ac_tag
+        academy_tags = {}
+        for main_key, academy_val in logic.academies.items():
+            ac_tag = logic.get_tag_for_aid(academy_val)
+            if ac_tag:
+                academy_tags[str(main_key)] = ac_tag
 
-    message = nap_mod.NapLogic.build_nap_message(ranking, academy_tags)
+        message = nap_mod.NapLogic.build_nap_message(ranking, academy_tags)
 
-    days = settings.get_int("nap_snapshot_lookback_protected", 0)
-    lookback = storage.nap_lookback_protected(days)
-    fallen = nap_mod.get_nap_protected_alliances(logic, lookback, days)["fallen_protected"]
-    if days > 0 and fallen:
-        parts = [f"[{e['abbr']}] (last ranked {e['last_seen_utc'].strftime('%Y-%m-%d')} UTC)" for e in fallen[:15]]
-        footer = f"🛡️ Still NAP-protected via {days}-day lookback:\n" + "\n".join(parts)
-        if len(fallen) > 15:
-            footer += f" … and {len(fallen) - 15} more"
-        message = message + "\n\n" + footer
+        days = settings.get_int("nap_snapshot_lookback_protected", 0)
+        lookback = storage.nap_lookback_protected(days)
+        fallen = nap_mod.get_nap_protected_alliances(logic, lookback, days)["fallen_protected"]
+        if days > 0 and fallen:
+            parts = [f"[{e['abbr']}] (last ranked {e['last_seen_utc'].strftime('%Y-%m-%d')} UTC)" for e in fallen[:15]]
+            footer = f"🛡️ Still NAP-protected via {days}-day lookback:\n" + "\n".join(parts)
+            if len(fallen) > 15:
+                footer += f" … and {len(fallen) - 15} more"
+            message = message + "\n\n" + footer
 
-    try:
-        channel = bot.get_channel(channel_id)
-        if channel is None:
-            channel = await bot.fetch_channel(channel_id)
-        await channel.send(message)
-    except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
-        logger.warning("Could not post NAP ranking to channel %s: %s", channel_id, e)
-        return False
-    storage.record_nap_ranking(ranking)
+        try:
+            channel = bot.get_channel(channel_id)
+            if channel is None:
+                channel = await bot.fetch_channel(channel_id)
+            await channel.send(message)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
+            logger.warning("Could not post NAP ranking to channel %s: %s", channel_id, e)
+            return False
+        storage.record_nap_ranking(ranking)
 
-    await _post_nap_tag_list(bot, logic, ranking, academy_tags, fallen, triggered_by=triggered_by)
-    logger.info("Posted NAP ranking (trigger=%s)", triggered_by)
-    return True
+        await _post_nap_tag_list(bot, logic, ranking, academy_tags, fallen, triggered_by=triggered_by)
+        logger.info("Posted NAP ranking (trigger=%s)", triggered_by)
+        return True
 
 
 async def _post_nap_tag_list(bot, logic, ranking, academy_tags, fallen, *, triggered_by="scheduler"):
