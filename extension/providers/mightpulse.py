@@ -437,17 +437,12 @@ async def fetch_kingdom_alliance_power_ranking(
             aid = row.get("aid")
             tag = row.get("abbr") or row.get("tag")
             name = row.get("name") or tag
-            power = row.get("power")
+            # The leaderboard "score" is the authoritative alliance power; the
+            # separate "power" field can be wildly off (e.g. ~9.5M vs ~1.8B
+            # in-game). Prefer "score", matching the monolith.
+            power = row.get("score")
             if power is None:
-                power = row.get("score")
-            elif row.get("score") is not None and str(row.get("score")) != str(power):
-                # The leaderboard "score" can be a different (combat) metric than
-                # the alliance's actual "power". Prefer "power" so alliance_list.power
-                # keeps the real value; log the mismatch for visibility.
-                print(
-                    f"[NAP] Ranking row aid={aid} score={row.get('score')} "
-                    f"power={power} (using power)"
-                )
+                power = row.get("power")
 
             try:
                 aid_key = int(aid) if aid is not None else None
