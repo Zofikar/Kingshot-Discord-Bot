@@ -52,12 +52,14 @@ async def setup(bot):
     bot.maintenance_lock = asyncio.Lock()
 
     # Load the identity cogs, overriding upstream /unregister (always) and
-    # /register (only when MightPulse is configured).
+    # /register (only when MightPulse is configured). The extension also
+    # restores the pre-migration /verify name and keeps /register as an alias.
     from .cogs.identity import IdentityBase, IdentityMightpulse
     bot.tree.remove_command("unregister")
     await bot.add_cog(IdentityBase(bot))
     if cfg.mightpulse_enabled:
         bot.tree.remove_command("register")
+        bot.tree.remove_command("verify")
         await bot.add_cog(IdentityMightpulse(bot))
 
     # Load the remaining extension cogs + scheduled tasks.

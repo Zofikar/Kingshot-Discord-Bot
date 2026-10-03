@@ -34,6 +34,20 @@ def test_register_player_reregister_keeps_main(tmp_path):
     assert storage.main_fid_for_discord(111, db_dir=db) == 200
 
 
+def test_linked_main_accounts_returns_one_primary_per_member(tmp_path):
+    db = str(tmp_path)
+    storage.register_player(fid=100, discord_id=111, discord_server_id=1, db_dir=db)
+    storage.register_player(fid=200, discord_id=111, discord_server_id=1, db_dir=db)
+    storage.set_main_fid(111, 200, db_dir=db)
+    storage.register_player(fid=300, discord_id=222, discord_server_id=2, db_dir=db)
+    storage.register_player(fid=400, discord_id=None, discord_server_id=2, db_dir=db)
+
+    assert storage.linked_main_accounts(db_dir=db) == [
+        (200, 111, 1),
+        (300, 222, 2),
+    ]
+
+
 def test_upsert_alliance_writes_extension_cols(tmp_path):
     db = str(tmp_path)
     storage.upsert_alliance(7, abbr="XYZ", name="Xyz", kid=2464, power=1000, db_dir=db)

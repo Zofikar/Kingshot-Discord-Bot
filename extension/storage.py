@@ -328,6 +328,28 @@ def main_fid_for_discord(discord_id: int, *, db_dir: str = "db"):
     return fids[0][0] if fids else None
 
 
+def linked_main_accounts(*, db_dir: str = "db") -> list:
+    """One ``(fid, discord_id, discord_server_id)`` row per linked member.
+
+    Explicit main accounts win; legacy rows with no main flag fall back to the
+    lowest FID, matching :func:`main_fid_for_discord`.
+    """
+    with _connect(os.path.join(db_dir, USERS_FILE)) as conn:
+        rows = conn.execute(
+            "SELECT fid, discord_id, discord_server_id, COALESCE(is_main, 0) "
+            "FROM users WHERE discord_id IS NOT NULL "
+            "ORDER BY discord_id, COALESCE(is_main, 0) DESC, fid ASC"
+        ).fetchall()
+    result = []
+    seen = set()
+    for fid, discord_id, server_id, _is_main in rows:
+        if discord_id in seen:
+            continue
+        seen.add(discord_id)
+        result.append((fid, discord_id, server_id))
+    return result
+
+
 def discord_ids_for_alliances(aids, *, db_dir: str = "db") -> list:
     """Distinct Discord user ids owning any FID in one of these alliances.
 

@@ -279,6 +279,7 @@ def _nightly_cog(monkeypatch, *, rows, fetched, nap_context, rows_fn=None, linke
                         lambda aid, **kw: upserts.append((aid, kw)))
     monkeypatch.setattr(nightly_mod.storage, "discord_ids_for_alliances",
                         linked or (lambda aids: []))
+    monkeypatch.setattr(nightly_mod.storage, "linked_main_accounts", lambda: [])
     monkeypatch.setattr(nightly_mod.storage, "Storage", _SaveRecorder)
     monkeypatch.setattr(nap_cog, "_nap_context", nap_context)
     _SaveRecorder.saved = []

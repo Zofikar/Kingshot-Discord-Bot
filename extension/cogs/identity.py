@@ -312,9 +312,7 @@ class IdentityMightpulse(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
-    @app_commands.command(name="register", description="Link your in-game ID and sync roles from live data.")
-    @app_commands.describe(gid="Your in-game Governor ID")
-    async def register(self, interaction, gid: str):
+    async def _verify(self, interaction, gid: str):
         await interaction.response.defer(ephemeral=True)
         settings = _settings(self.bot)
         player = await mightpulse.fetch_player_data(gid, force_refresh=True)
@@ -341,6 +339,17 @@ class IdentityMightpulse(commands.Cog):
         )
         await sync_member(self.bot, interaction.user)
         await interaction.followup.send(f"Linked and synced ID `{gid}`.", ephemeral=True)
+
+    @app_commands.command(name="verify", description="Verify your Governor ID and sync roles from live data.")
+    @app_commands.describe(gid="Your in-game Governor ID")
+    async def verify(self, interaction, gid: str):
+        await self._verify(interaction, str(gid).strip())
+
+    @app_commands.command(name="register", description="Link your in-game ID and sync roles from live data.")
+    @app_commands.describe(gid="Your in-game Governor ID")
+    async def register(self, interaction, gid: str):
+        """Compatibility alias for /verify."""
+        await self._verify(interaction, str(gid).strip())
 
     @app_commands.command(name="refresh", description="Re-sync your roles and nickname from live data.")
     async def refresh(self, interaction):

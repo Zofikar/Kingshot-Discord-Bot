@@ -150,6 +150,7 @@ def test_nightly_maintenance_waits_for_maintenance_lock(monkeypatch):
 
     monkeypatch.setattr(cog, "_discover_candidates", _no_discovery)
     monkeypatch.setattr(nightly_mod.storage, "all_alliances", lambda: [])
+    monkeypatch.setattr(nightly_mod.storage, "linked_main_accounts", lambda: [])
 
     async def scenario():
         await bot.maintenance_lock.acquire()

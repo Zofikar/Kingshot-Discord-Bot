@@ -40,6 +40,7 @@ class NightlyTasks(commands.Cog):
         # Last `_sync_alliance_discord_state` counts, so /admin_nightly_refresh can
         # report what actually reached Discord.
         self.last_tag_sync = {"linked": 0, "retagged": 0}
+        self.last_player_sync = {"synced": 0, "skipped": 0}
 
     async def cog_load(self):
         if mightpulse.available():
@@ -138,9 +139,64 @@ class NightlyTasks(commands.Cog):
             # The rows above are fresh; make Discord agree with them (role names
             # and every member's `[TAG]` nickname prefix).
             resynced = await self._sync_alliance_discord_state()
+            player_sync = await self._sync_linked_players()
             logger.info(
-                "Nightly maintenance done (trigger=%s, discovered=%s, members_resynced=%s)",
-                triggered_by, discovered, resynced)
+                "Nightly maintenance done (trigger=%s, discovered=%s, members_resynced=%s, "
+                "players_synced=%s, players_skipped=%s)",
+                triggered_by, discovered, resynced,
+                player_sync["synced"], player_sync["skipped"])
+
+    async def _sync_linked_players(self) -> dict:
+        """Refresh every linked main FID and reconcile its Discord member.
+
+        Nightly alliance maintenance alone cannot see an in-game player rename.
+        This mirrors the pre-migration monolith: bypass the process-local cache,
+        persist trustworthy current player data, then apply nickname and roles.
+        """
+        from ..cogs.identity import sync_member
+        from ..roles import player_to_user_fields
+
+        stats = {"synced": 0, "skipped": 0}
+        guilds = list(getattr(self.bot, "guilds", None) or [])
+
+        for fid, discord_id, server_id in storage.linked_main_accounts():
+            player = await mightpulse.fetch_player_data(
+                fid, force_refresh=False, bypass_local_cache=True)
+            if not isinstance(player, dict):
+                stats["skipped"] += 1
+                logger.warning("Player update failed for fid=%s; keeping previous profile.", fid)
+                continue
+
+            fields = player_to_user_fields(fid, player)
+            storage.register_player(
+                fid=fields["fid"], discord_id=discord_id,
+                discord_server_id=server_id, nickname=fields["nickname"],
+                kid=fields["kid"], alliance_aid=fields["alliance_aid"],
+                rank=fields["rank"], power=fields["power"],
+                abbr=fields["abbr"], alliance_name=fields["alliance_name"],
+            )
+
+            candidate_guilds = [g for g in guilds if server_id is None or g.id == server_id]
+            member = None
+            for guild in candidate_guilds:
+                member = guild.get_member(int(discord_id))
+                if member is None:
+                    try:
+                        member = await guild.fetch_member(int(discord_id))
+                    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                        member = None
+                if member is not None:
+                    break
+
+            if member is None:
+                stats["skipped"] += 1
+                continue
+
+            await sync_member(self.bot, member)
+            stats["synced"] += 1
+
+        self.last_player_sync = stats
+        return stats
 
     async def _sync_alliance_discord_state(self) -> int:
         """Re-tag alliance roles + member nicknames from the stored alliance rows.
@@ -291,9 +347,11 @@ class NightlyTasks(commands.Cog):
             await interaction.followup.send(f"Nightly maintenance failed: {e}", ephemeral=True)
             return
         sync = self.last_tag_sync
+        players = self.last_player_sync
         await interaction.followup.send(
             "Nightly maintenance finished.\n"
             f"Discord tag sync: {sync['linked']} linked member(s) re-applied, "
             f"{sync['retagged']} stale tag(s) rewritten "
-            f"(alliances tracked: {len(storage.all_alliances())}).",
+            f"(alliances tracked: {len(storage.all_alliances())}).\n"
+            f"Player profiles: {players['synced']} synced, {players['skipped']} skipped.",
             ephemeral=True)
