@@ -163,3 +163,37 @@ def test_nightly_maintenance_waits_for_maintenance_lock(monkeypatch):
         return blocked_while_locked
 
     assert asyncio.run(scenario()) is True
+
+
+def test_nap_post_can_run_while_player_sync_is_still_running(tmp_path, monkeypatch):
+    """00:05 posting waits for alliances, not the slower player-name refresh."""
+    channel = _FakeChannel()
+    bot = _prepare(monkeypatch, tmp_path, channel=channel)
+    bot.guilds = []
+    cog = nightly_mod.NightlyTasks(bot)
+    player_sync_started = asyncio.Event()
+    release_player_sync = asyncio.Event()
+
+    async def _no_discovery():
+        return 0
+
+    async def _slow_player_sync():
+        player_sync_started.set()
+        await release_player_sync.wait()
+        return {"synced": 0, "skipped": 0}
+
+    monkeypatch.setattr(cog, "_discover_candidates", _no_discovery)
+    monkeypatch.setattr(cog, "_sync_alliance_discord_state", lambda: asyncio.sleep(0, result=0))
+    monkeypatch.setattr(cog, "_sync_linked_players", _slow_player_sync)
+    monkeypatch.setattr(nightly_mod.storage, "all_alliances", lambda: [])
+
+    async def scenario():
+        maintenance = asyncio.create_task(cog._run_nightly_maintenance(triggered_by="test"))
+        await asyncio.wait_for(player_sync_started.wait(), timeout=5)
+        posted = await asyncio.wait_for(nap_cog.post_nap_ranking(bot), timeout=5)
+        release_player_sync.set()
+        await asyncio.wait_for(maintenance, timeout=5)
+        return posted
+
+    assert asyncio.run(scenario()) is True
+    assert len(channel.messages) == 1

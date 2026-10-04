@@ -69,10 +69,15 @@ async def post_nap_ranking(bot, *, triggered_by="scheduler"):
         settings = _settings(bot)
         channel_id = settings.get_int("nap_channel_id")
         if not channel_id:
+            logger.error("Cannot post NAP ranking: ext.nap_channel_id is not configured.")
             return False
         logic, _ = _nap_context(bot)
         ranking = await logic.get_nap_ranking()
         if not ranking:
+            logger.error(
+                "Cannot post NAP ranking: stored alliance snapshot does not contain "
+                "enough valid, non-excluded alliances with positive power."
+            )
             return False
 
         academy_tags = {}

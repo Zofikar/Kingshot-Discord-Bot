@@ -65,7 +65,12 @@ class NightlyTasks(commands.Cog):
     async def daily_nap_post(self):
         await self.bot.wait_until_ready()
         try:
-            await self._post_nap_ranking(triggered_by="scheduler")
+            posted = await self._post_nap_ranking(triggered_by="scheduler")
+            if not posted:
+                logger.error(
+                    "Scheduled NAP post did not publish. Check nap_channel_id, "
+                    "the stored alliance count/power snapshot, and channel permissions."
+                )
         except Exception as e:
             logger.exception("Daily NAP post failed: %s", e)
 
@@ -94,6 +99,9 @@ class NightlyTasks(commands.Cog):
         return min(len(candidates), candidate_count)
 
     async def _run_nightly_maintenance(self, *, triggered_by="scheduler"):
+        # Only alliance snapshot work is protected by maintenance_lock. The NAP
+        # post depends on that snapshot, but it must not wait behind the much
+        # longer player-profile refresh that follows.
         async with self.bot.maintenance_lock:
             # Historical tag -> aid aliases so a renamed alliance stays resolvable
             # (lookback protection, /admin_academy_set, exclusions) exactly like
@@ -139,12 +147,17 @@ class NightlyTasks(commands.Cog):
             # The rows above are fresh; make Discord agree with them (role names
             # and every member's `[TAG]` nickname prefix).
             resynced = await self._sync_alliance_discord_state()
-            player_sync = await self._sync_linked_players()
             logger.info(
-                "Nightly maintenance done (trigger=%s, discovered=%s, members_resynced=%s, "
-                "players_synced=%s, players_skipped=%s)",
-                triggered_by, discovered, resynced,
-                player_sync["synced"], player_sync["skipped"])
+                "Nightly alliance snapshot done (trigger=%s, discovered=%s, members_resynced=%s)",
+                triggered_by, discovered, resynced)
+
+        # Player names/roles do not affect the NAP ranking. Run them after the
+        # alliance lock is released so the 00:05 UTC post can proceed as soon as
+        # its authoritative alliance snapshot is complete.
+        player_sync = await self._sync_linked_players()
+        logger.info(
+            "Nightly player sync done (trigger=%s, players_synced=%s, players_skipped=%s)",
+            triggered_by, player_sync["synced"], player_sync["skipped"])
 
     async def _sync_linked_players(self) -> dict:
         """Refresh every linked main FID and reconcile its Discord member.
