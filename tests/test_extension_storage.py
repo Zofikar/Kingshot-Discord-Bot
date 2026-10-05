@@ -15,6 +15,33 @@ def test_register_player_first_is_main(tmp_path):
     assert row["nickname"] == "Bob" and row["rank"] == 4 and row["power"] == 1000
 
 
+def test_register_player_preserves_alliance_power(tmp_path):
+    db = str(tmp_path)
+    storage.upsert_alliance(247300011, abbr="TKO", name="theknightsONE",
+                            kid=2464, role_id=1544429714104385500,
+                            power=2105508213, db_dir=db)
+    storage.register_player(fid=100, discord_id=111, alliance_aid=247300011,
+                            abbr="TKO", alliance_name="theknightsONE", kid=2464,
+                            power=33912143, db_dir=db)
+
+    assert storage.user_row(100, db_dir=db)["power"] == 33912143
+    alliance = storage.alliance_row(247300011, db_dir=db)
+    assert alliance["power"] == 2105508213
+    assert alliance["role_id"] == 1544429714104385500
+
+
+def test_register_player_does_not_seed_alliance_with_player_power(tmp_path):
+    db = str(tmp_path)
+    storage.register_player(fid=100, discord_id=111, alliance_aid=7,
+                            abbr="XYZ", alliance_name="Xyz", kid=2464,
+                            power=33912143, db_dir=db)
+
+    alliance = storage.alliance_row(7, db_dir=db)
+    assert alliance["abbr"] == "XYZ"
+    assert alliance["power"] is None
+    assert storage.user_row(100, db_dir=db)["power"] == 33912143
+
+
 def test_register_player_second_is_secondary(tmp_path):
     db = str(tmp_path)
     storage.register_player(fid=100, discord_id=111, db_dir=db)

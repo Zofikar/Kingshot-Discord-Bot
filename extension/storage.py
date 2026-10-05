@@ -507,7 +507,9 @@ def register_player(*, fid, discord_id, discord_server_id=None, nickname=None, k
             )
 
     if alliance_aid is not None:
-        upsert_alliance(alliance_aid, abbr=abbr, name=alliance_name, kid=kid, power=power,
+        # `power` belongs to this player, not the alliance total. In particular,
+        # nightly player sync must not overwrite the fresh alliance snapshot.
+        upsert_alliance(alliance_aid, abbr=abbr, name=alliance_name, kid=kid,
                         db_dir=db_dir)
 
 
