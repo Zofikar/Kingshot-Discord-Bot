@@ -15,6 +15,10 @@ logger = logging.getLogger('gift')
 PAGE_SIZE = 25
 
 
+def _count(n, word):
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
 def _scan_lines(cog):
     """Live kingdom-scan progress lines, or nothing when no scan is queued."""
     running = cog.kingdom_scan_status()
@@ -74,10 +78,10 @@ def parse_scan_range(lo_text, hi_text):
 
 def _queue_result_text(queued):
     if queued is None:
-        return "A kingdom scan is already running. It's working through the list."
+        return "A kingdom scan is already running."
     if queued == 0:
         return "Nobody needs a scan right now."
-    return (f"Scanning {queued} member(s) now. It steps aside whenever a gift code needs "
+    return (f"Scanning {_count(queued, 'member')} now. It steps aside whenever a gift code needs "
             f"redeeming, so it can take a while.")
 
 
@@ -179,7 +183,7 @@ class StateManagementView(_MenuView):
 
         scan = (f"On, kingdoms {settings['min']}-{settings['max']}" if settings['enabled'] else "Off")
         lines = [
-            "Redemption needs each member's kingdom. Fix missing or wrong ones here.\n",
+            "Gift code redemption needs each member's kingdom. You can fix missing or wrong kingdoms here.\n",
             f"{theme.upperDivider}",
             f"{theme.membersIcon} **Members to fix:** `{counts['wrong']}` wrong kingdom, "
             f"`{counts['missing']}` no kingdom",
@@ -248,8 +252,8 @@ class MembersToFixView(_PagedView):
         self._add_button("Back", theme.backIcon, discord.ButtonStyle.secondary, 3, self._back_to_hub)
 
         lines = [
-            "These members have no kingdom on file, or the game rejected theirs the last time "
-            "a code was redeemed for them. Usually they transferred or left the game.\n",
+            "These members have no kingdom on file, or the game rejected their kingdom the last time "
+            "a code was redeemed for them. A rejected kingdom usually means they transferred or left the game.\n",
             f"{theme.upperDivider}",
             f"{theme.stateIcon} **Wrong kingdom:** `{wrong}`",
             f"{theme.membersIcon} **No kingdom:** `{missing}`\n",
@@ -258,11 +262,11 @@ class MembersToFixView(_PagedView):
             f"{theme.membersIcon} **Set All to Kingdom**",
             "└ Put every member with a wrong kingdom in one kingdom, for a group that transferred together.",
             f"{theme.allianceIcon} **Use Alliance Kingdom**",
-            "└ Give members with no kingdom their alliance's kingdom. Instant.",
+            "└ Give members with no kingdom their alliance's kingdom right away.",
             f"{theme.searchIcon} **Scan These Now**",
-            "└ Try kingdom numbers for each member in the background until one fits. Can take hours.",
+            "└ Try kingdom numbers for each member in the background until one fits. This can take hours.",
             f"{theme.trashIcon} **Dismiss Warnings**",
-            "└ Clear the wrong-kingdom warnings. Members still wrong come back after the next redemption.",
+            "└ Clear the wrong-kingdom warnings. Members who are still wrong show up again after the next redemption.",
         ]
         lines.extend(_scan_lines(self.cog))
         lines.extend(_catchup_lines(self.cog))
@@ -288,9 +292,9 @@ class MembersToFixView(_PagedView):
     async def _on_use_alliance(self, interaction: discord.Interaction):
         n, caught = await asyncio.to_thread(self.cog.assign_alliance_state_to_missing)
         self.last_result = (
-            f"Gave {n} member(s) their alliance's kingdom."
+            f"Gave {_count(n, 'member')} their alliance's kingdom."
             + (f" Redeeming the codes {caught} of them missed." if caught else "")
-            if n else "No member with a missing kingdom is in an alliance that has a kingdom."
+            if n else "Their alliances don't have a kingdom yet either. Give the alliances a kingdom first."
         )
         await self.refresh(interaction)
 
@@ -302,7 +306,7 @@ class MembersToFixView(_PagedView):
         wrong = [r[0] for r in self.rows if r[3] == 'wrong']
         await asyncio.to_thread(gsr.clear_state_mismatch_many, wrong)
         self.cog.logger.info(f"GiftOps: admin dismissed {len(wrong)} wrong-kingdom warning(s)")
-        self.last_result = f"Dismissed {len(wrong)} warning(s)."
+        self.last_result = f"Dismissed {_count(len(wrong), 'warning')}."
         await self.refresh(interaction)
 
 
@@ -336,16 +340,16 @@ class AllianceKingdomsView(_PagedView):
         bound = sum(1 for r in self.rows if r["current_kid"] is not None and not r["multistate"])
         multi = sum(1 for r in self.rows if r["multistate"])
         lines = [
-            "An alliance's kingdom is used for members with no kingdom of their own, and new "
-            "members are checked against it.\n",
+            "Members with no kingdom of their own use their alliance's kingdom. Only players from "
+            "that kingdom can be added or moved into the alliance.\n",
             f"{theme.upperDivider}",
             f"{theme.allianceIcon} **With a kingdom:** `{bound}` · **Without:** "
             f"`{len(self.rows) - bound - multi}` · **Multi-kingdom:** `{multi}`\n",
             f"{theme.chartIcon} **Auto-bind Alliances**",
             "└ Give each alliance the kingdom most of its members are in.",
             f"{theme.allianceIcon} **Pick an alliance**",
-            "└ Mark or unmark it as multi-kingdom. Those are never auto-bound and their members "
-            "keep their own kingdoms.",
+            "└ Mark or unmark it as multi-kingdom. Multi-kingdom alliances are never auto-bound, and their "
+            "members keep their own kingdoms.",
             f"\n{theme.infoIcon} Too few known members to auto-bind? Pick the alliance under "
             f"Alliance Management and use **Set Kingdom**.",
         ]
@@ -366,7 +370,7 @@ class AllianceKingdomsView(_PagedView):
         result = await asyncio.to_thread(self.cog.bind_alliance_states)
         b, m = len(result["bound"]), len(result["multistate"])
         self.last_result = (
-            f"Gave {b} alliance(s) a kingdom; marked {m} as multi-kingdom."
+            f"Gave {_count(b, 'alliance')} a kingdom and marked {m} as multi-kingdom."
             if (b or m) else "No alliance had a clear majority to bind."
         )
         await self.refresh(interaction)
@@ -403,9 +407,9 @@ class KingdomScanView(_MenuView):
         lines += [
             f"{theme.lowerDivider}",
             f"{theme.searchIcon} **Auto-scan**",
-            "└ Turn the background scan on or off.",
+            "└ When it's on, the bot scans members who need a kingdom whenever it's idle.",
             f"{theme.stateIcon} **Set Range**",
-            "└ The lowest and highest kingdom number to check.",
+            "└ Limit the scan to the kingdom numbers your members could be in.",
             f"\n{theme.infoIcon} A full scan can take several hours per member. Members it finds "
             f"get the codes they missed.",
         ]

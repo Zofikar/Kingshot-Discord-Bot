@@ -77,8 +77,8 @@ def _split_by_state_lock(alliance_id, fids):
 
 def _state_skip_line(target_name, locked_kid, skipped) -> str:
     return (
-        f"Skipped **{len(skipped)}** member(s) from another kingdom "
-        f"(**{target_name}** only accepts Kingdom #{locked_kid}): {_join_names(skipped, 500)}"
+        f"Skipped **{len(skipped)}** {'member' if len(skipped) == 1 else 'members'} from another kingdom, "
+        f"because **{target_name}** only accepts Kingdom #{locked_kid}: {_join_names(skipped, 500)}"
     )
 
 
@@ -287,12 +287,12 @@ class MemberListView(discord.ui.View):
     CAN_EDIT = False
     PAGE_SIZE = 20
     SORTS = [
-        ("FC \u2193",      lambda m: (-m['furnace_lv'], m['nickname'].casefold()), False),
-        ("FC \u2191",      lambda m: (m['furnace_lv'], m['nickname'].casefold()),  False),
+        ("TC \u2193",      lambda m: (-m['furnace_lv'], m['nickname'].casefold()), False),
+        ("TC \u2191",      lambda m: (m['furnace_lv'], m['nickname'].casefold()),  False),
         ("Name A→Z",  lambda m: m['nickname'].casefold(),                      False),
         ("Name Z→A",  lambda m: m['nickname'].casefold(),                      True),
         ("ID \u2191",      lambda m: m['fid'],                                       False),
-        ("State \u2191",   lambda m: (m['kid'] is None, m['kid'] or 0, -m['furnace_lv']), False),
+        ("Kingdom \u2191", lambda m: (m['kid'] is None, m['kid'] or 0, -m['furnace_lv']), False),
     ]
 
     def __init__(self, members, alliance_id, alliance_name, cog, author_id):
@@ -2401,8 +2401,8 @@ class AllianceMemberOperations(commands.Cog):
                         dm_embed.add_field(
                             name=f"{theme.chartIcon} Statistics",
                             value=(
-                                f"**Highest FC:** {self.level_mapping.get(max_fc, str(max_fc))}\n"
-                                f"**Average FC:** {self.level_mapping.get(int(avg_fc), str(int(avg_fc)))}"
+                                f"**Highest TC:** {self.level_mapping.get(max_fc, str(max_fc))}\n"
+                                f"**Average TC:** {self.level_mapping.get(int(avg_fc), str(int(avg_fc)))}"
                             ),
                             inline=False
                         )
@@ -2814,7 +2814,7 @@ class IDSearchModal(discord.ui.Modal):
                                 embed=discord.Embed(
                                     title=f"{theme.deniedIcon} Transfer Blocked",
                                     description=(KINGDOM_CHECK_UNAVAILABLE if not lock_ok
-                                                 else f"**{nickname}** was not moved. "
+                                                 else f"**{nickname}** wasn't moved. "
                                                       f"{kingdom_lock_reason(locked_kid, None)}"),
                                     color=theme.emColor2
                                 ),
