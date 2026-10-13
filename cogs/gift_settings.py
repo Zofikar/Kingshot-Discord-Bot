@@ -1,11 +1,8 @@
 """Gift code settings — test FID management, redemption priority, and auto-redemption setup."""
 
 import discord
-import asyncio
 import sqlite3
 import logging
-import requests
-import json
 
 from .pimp_my_bot import theme, safe_edit_message, check_interaction_user, menu_timeout, confirm_timeout
 from .alliance_member_operations import AllianceSelectView
@@ -38,61 +35,6 @@ logger = logging.getLogger('gift')
 # ---------------------------------------------------------------------------
 # Standalone functions (converted from cog methods: self -> cog)
 # ---------------------------------------------------------------------------
-
-async def verify_test_fid(cog, fid):
-    """
-    Verify that a ID is valid by attempting to login to the account.
-
-    Args:
-        fid (str): The ID to verify
-
-    Returns:
-        tuple: (is_valid, message) where is_valid is a boolean and message is a string
-    """
-    session = None
-    try:
-        cog.logger.info(f"Verifying test ID: {fid}")
-
-        session, response_stove_info = await cog.get_stove_info_wos(fid)
-
-        try:
-            player_info_json = response_stove_info.json()
-        except json.JSONDecodeError:
-            cog.logger.error(f"Invalid JSON response when verifying ID {fid}")
-            return False, "Invalid response from server"
-
-        login_successful = player_info_json.get("msg") == "success"
-
-        if login_successful:
-            try:
-                nickname = player_info_json.get("data", {}).get("nickname", "Unknown")
-                castle_lv = player_info_json.get("data", {}).get("stove_lv", "Unknown")
-                cog.logger.info(f"Test ID {fid} is valid. Nickname: {nickname}, Level: {castle_lv}")
-                return True, "Valid account"
-            except Exception as e:
-                cog.logger.exception(f"Error parsing player info for ID {fid}: {e}")
-                return True, "Valid account (but error getting details)"
-        else:
-            error_msg = player_info_json.get("msg", "Unknown error")
-            cog.logger.info(f"Test ID {fid} is invalid. Error: {error_msg}")
-            return False, f"Login failed: {error_msg}"
-
-    except requests.exceptions.ConnectionError:
-        cog.logger.warning(f"Connection error verifying test ID {fid}. Check bot connectivity to the Kingshot Gift Code API.")
-        return False, "Connection error: Kingshot API unavailable"
-    except requests.exceptions.Timeout:
-        cog.logger.warning(f"Timeout verifying test ID {fid}. Check bot connectivity to the Kingshot Gift Code API.")
-        return False, "Connection error: Request timed out"
-    except requests.exceptions.RequestException as e:
-        cog.logger.warning(f"Request error verifying test ID {fid}: {type(e).__name__}")
-        return False, f"Connection error: {type(e).__name__}"
-    except Exception as e:
-        cog.logger.exception(f"Error verifying test ID {fid}: {e}")
-        return False, f"Verification error: {str(e)}"
-    finally:
-        if session:
-            session.close()
-
 
 def get_test_fid(cog):
     """
@@ -158,11 +100,10 @@ async def get_validation_fid(cog):
         result = cog.settings_cursor.fetchone()
 
         if result and result[0] != DEFAULT_TEST_FID:
-            # Test ID is configured, verify it's valid
-            is_valid, _ = await verify_test_fid(cog, test_fid)
-            if is_valid:
-                cog.logger.info(f"Using configured test ID for validation: {test_fid}")
-                return test_fid, 'test_fid'
+            # A configured test ID is used as-is; a bad/kid-less one just yields NO_STATE
+            # during validation, which rotates to member IDs.
+            cog.logger.info(f"Using configured test ID for validation: {test_fid}")
+            return test_fid, 'test_fid'
 
         # Second try: Use a random alliance member
         with sqlite3.connect('db/users.sqlite') as users_conn:
@@ -313,22 +254,20 @@ async def setup_giftcode_auto(cog, interaction: discord.Interaction):
         color=theme.emColor1
     )
 
-    view = AllianceSelectView(alliances_with_counts, cog, context="giftcode")
-
-    view.current_select.options.insert(0, discord.SelectOption(
-        label="ENABLE ALL ALLIANCES",
-        value="enable_all",
-        description="Enable automatic redemption for all alliances",
-        emoji=f"{theme.verifiedIcon}"
-    ))
-
-    view.current_select.options.insert(1, discord.SelectOption(
-        label="DISABLE ALL ALLIANCES",
-        value="disable_all",
-        description="Disable automatic redemption for all alliances",
-        emoji=f"{theme.deniedIcon}"
-    ))
-    view.current_select.options = view.current_select.options[:25]
+    view = AllianceSelectView(alliances_with_counts, cog, context="giftcode", extra_options=[
+        discord.SelectOption(
+            label="ENABLE ALL ALLIANCES",
+            value="enable_all",
+            description="Enable automatic redemption for all alliances",
+            emoji=f"{theme.verifiedIcon}"
+        ),
+        discord.SelectOption(
+            label="DISABLE ALL ALLIANCES",
+            value="disable_all",
+            description="Disable automatic redemption for all alliances",
+            emoji=f"{theme.deniedIcon}"
+        ),
+    ])
 
     async def alliance_callback(select_interaction: discord.Interaction, alliance_id=None):
         try:

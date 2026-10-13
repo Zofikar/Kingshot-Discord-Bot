@@ -5,9 +5,11 @@ codes stayed pending and never auto-redeemed.
 """
 import asyncio
 import importlib
+import sqlite3
 from types import SimpleNamespace
 
 gr = importlib.import_module("cogs.gift_redemption")
+gs = importlib.import_module("cogs.gift_settings")
 
 
 def _cog(primary):
@@ -47,3 +49,18 @@ def test_no_id_with_state_skips_the_run(monkeypatch):
     cog, _ = _cog("111")
     fid, _ = asyncio.run(gr.resolve_periodic_validation_fid(cog))
     assert fid is None
+
+
+def _settings_cog(saved_fid):
+    conn = sqlite3.connect(":memory:")
+    gs.ensure_test_fid_settings(conn)
+    conn.execute("DELETE FROM test_fid_settings")
+    conn.execute("INSERT INTO test_fid_settings (test_fid, kid) VALUES (?, 259)", (saved_fid,))
+    logger = SimpleNamespace(info=lambda *a: None, exception=lambda *a: None)
+    return SimpleNamespace(settings_cursor=conn.cursor(), logger=logger)
+
+
+def test_configured_test_id_is_used_without_a_player_lookup():
+    cog = _settings_cog("12345678")
+    assert asyncio.run(gs.get_validation_fid(cog)) == ("12345678", "test_fid")
+    assert not hasattr(gs, "verify_test_fid")

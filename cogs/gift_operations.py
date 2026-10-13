@@ -13,10 +13,10 @@ import asyncio
 import os
 import traceback
 import logging
-from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from .gift_operationsapi import GiftCodeAPI
 from .pimp_my_bot import theme, safe_edit_message
+from . import alliance_api_sync
 from . import gift_redemption
 from . import gift_state_resolver
 from . import onnx_lifecycle
@@ -113,7 +113,6 @@ class GiftOperations(commands.Cog):
             pass
 
         # Kingshot API URLs and Key
-        self.wos_player_info_url = "https://kingshot-giftcode.centurygame.com/api/player"
         self.wos_giftcode_url = "https://kingshot-giftcode.centurygame.com/api/gift_code"
         self.wos_giftcode_redemption_url = "https://kingshot-giftcode.centurygame.com"
         self.wos_encrypt_key = "mN4!pQs6JrYwV9"
@@ -123,8 +122,6 @@ class GiftOperations(commands.Cog):
 
         # Initialization of Locks and Cooldowns
         self._validation_lock = asyncio.Lock()
-        self.last_validation_attempt_time = 0
-        self.validation_cooldown = 5
         self._last_cleanup_date = None
         self._state_nudge_sent = False  # one-time boot nudge about member kingdoms
 
@@ -392,9 +389,6 @@ class GiftOperations(commands.Cog):
     def batch_process_alliance_results(self, results_batch):
         return gift_redemption.batch_process_alliance_results(self, results_batch)
 
-    async def get_stove_info_wos(self, player_id):
-        return await gift_redemption.get_stove_info_wos(self, player_id)
-
     async def claim_giftcode_rewards_wos(self, player_id, giftcode, *, skip_cache: bool = False):
         return await gift_redemption.claim_giftcode_rewards_wos(self, player_id, giftcode, skip_cache=skip_cache)
 
@@ -463,6 +457,8 @@ class GiftOperations(commands.Cog):
             return False
         counts = process_queue_cog.queue_counts()
         if counts['queued'] or counts['active'] or onnx_lifecycle.any_model_in_use():
+            return False
+        if alliance_api_sync.budget_spent():
             return False
         return bool(self.queue_kingdom_scan('auto'))
 
@@ -556,9 +552,6 @@ class GiftOperations(commands.Cog):
         return await gift_channels.channel_history_scan(self, interaction)
 
     # ── Delegation to gift_settings ───────────────────────────────────
-
-    async def verify_test_fid(self, fid):
-        return await gift_settings.verify_test_fid(self, fid)
 
     async def update_test_fid(self, new_fid, kid=None):
         return await gift_settings.update_test_fid(self, new_fid, kid)
