@@ -1,0 +1,12 @@
+services:
+  kingshot-bot:
+    build: .
+    container_name: kingshot_verification_bot
+    image: kingshot-discord-bot:local
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - /var/kingshot-bot/log:/app/log #ChangeMe
+      - /var/kingshot-bot/db:/app/db #ChangeMe
+      - /var/kingshot-bot/backups:/app/backups #ChangeMe
