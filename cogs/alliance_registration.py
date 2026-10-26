@@ -6,11 +6,12 @@ import asyncio
 import logging
 from contextlib import closing
 from datetime import datetime, timezone
-from .pimp_my_bot import theme
+from .pimp_my_bot import theme, menu_timeout
 from .alliance import check_alliance_kingdom
-from .gift_state_resolver import verify_add_state, get_alliance_kid
+from .gift_state_resolver import get_alliance_kid
 from .bot_level_mapping import parse_furnace_level, parse_state
-from .alliance_member_edit import apply_member_edit, new_member_name
+from .alliance_member_edit import api_state_refusal, apply_member_edit
+from .alliance_api_sync import look_up_new_member, store_new_member
 
 logger = logging.getLogger('alliance')
 
@@ -118,40 +119,45 @@ class AllianceRegistration(commands.Cog):
 
     # ── DB writes ──────────────────────────────────────────────────────────
 
+    def _write_users(self, sql: str, params: tuple):
+        # Roll back on failure: this connection lives as long as the cog and would hold the lock.
+        try:
+            self.c_users.execute(sql, params)
+            self.conn_users.commit()
+        except sqlite3.Error:
+            self.conn_users.rollback()
+            raise
+
     def _insert_new_user(self, fid: int, user_data: dict, alliance: int,
                          discord_id: int, server_id: int):
-        self.c_users.execute(
+        self._write_users(
             "INSERT INTO users (fid, nickname, furnace_lv, kid, stove_lv_content, "
             "alliance, discord_id, discord_server_id, discord_id_updated_at) "
             "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (fid, user_data["nickname"], user_data["stove_lv"], user_data["kid"],
              user_data.get("stove_lv_content"), alliance, discord_id, server_id, _now_iso()),
         )
-        self.conn_users.commit()
 
     def _attach_discord_to_existing(self, fid: int, discord_id: int, server_id: int):
-        self.c_users.execute(
+        self._write_users(
             "UPDATE users SET discord_id = ?, discord_server_id = ?, "
             "discord_id_updated_at = ? WHERE fid = ?",
             (discord_id, server_id, _now_iso(), fid),
         )
-        self.conn_users.commit()
 
     def _move_registration_to_server(self, fid: int, new_server_id: int):
-        self.c_users.execute(
+        self._write_users(
             "UPDATE users SET discord_server_id = ?, discord_id_updated_at = ? "
             "WHERE fid = ?",
             (new_server_id, _now_iso(), fid),
         )
-        self.conn_users.commit()
 
     def _detach_discord(self, fid: int):
-        self.c_users.execute(
+        self._write_users(
             "UPDATE users SET discord_id = NULL, discord_server_id = NULL, "
             "discord_id_updated_at = ? WHERE fid = ?",
             (_now_iso(), fid),
         )
-        self.conn_users.commit()
 
     # ── /register ──────────────────────────────────────────────────────────
 
@@ -163,8 +169,8 @@ class AllianceRegistration(commands.Cog):
         fid="Your In-Game ID",
         alliance="Your Alliance Name",
         kingdom="Your kingdom number. Only needed if your alliance spans several kingdoms",
-        name="Your in-game name",
-        level="Your town center level, like 30 or TC 10",
+        name="Your in-game name (optional)",
+        level="Your town center level, like 30 or TC 10 (optional)",
     )
     @discord.app_commands.rename(fid="id")
     @discord.app_commands.autocomplete(alliance=alliance_autocomplete)
@@ -242,33 +248,35 @@ class AllianceRegistration(commands.Cog):
             await self._send_register_success(interaction, fid, caller_id, action="linked")
             return
 
-        # Resolve kingdom with one probe; defer first since it's slow.
+        # The API lookup and the kingdom probe are slow, so defer first.
         await interaction.response.defer(ephemeral=True)
+        kid = typed_kid = None
         if kingdom is not None:
-            kid = parse_state(kingdom)
+            kid = typed_kid = parse_state(kingdom)
             if kid is None:
                 await interaction.followup.send(
                     f"{theme.deniedIcon} `{kingdom}` isn't a kingdom number. "
                     f"Enter digits only, like `259`.", ephemeral=True)
                 return
-        else:
-            gift_cog = self.bot.get_cog("GiftOperations")
-            kid = (await verify_add_state(gift_cog, fid, alliance))[0] if gift_cog else None
+        member = await look_up_new_member(self.bot, fid, alliance, name, furnace_lv, probe=typed_kid is None)
+        if member.kid is not None:
+            kid = member.kid
+        elif kid is None and await asyncio.to_thread(get_alliance_kid, alliance) is None:
             # No home kingdom to inherit or confirm against, so we can't work it out.
-            if kid is None and await asyncio.to_thread(get_alliance_kid, alliance) is None:
-                await interaction.followup.send(
-                    f"{theme.infoIcon} This alliance has members in several kingdoms, so "
-                    f"we can't tell which one you're in. Run `/register` again and fill in "
-                    f"the **kingdom** option with your kingdom number.", ephemeral=True)
-                return
+            await interaction.followup.send(
+                f"{theme.infoIcon} This alliance has members in several kingdoms, so "
+                f"we can't tell which one you're in. Run `/register` again and fill in "
+                f"the **kingdom** option with your kingdom number.", ephemeral=True)
+            return
 
-        kingdom_error = check_alliance_kingdom(alliance, kid)
+        kingdom_error = api_state_refusal(check_alliance_kingdom(alliance, kid), member.kid, typed_kid)
         if kingdom_error:
             await interaction.followup.send(f"{theme.deniedIcon} {kingdom_error}", ephemeral=True)
             return
 
-        user_data = {"nickname": new_member_name(name, fid), "stove_lv": furnace_lv or 0, "kid": kid}
+        user_data = {"nickname": member.nickname, "stove_lv": member.furnace_lv, "kid": kid}
         self._insert_new_user(fid, user_data, alliance, caller_id, current_server_id)
+        await store_new_member(member, fid)
         await self._send_register_success(interaction, fid, caller_id, action="registered")
 
     async def _send_register_success(self, interaction: discord.Interaction,
@@ -368,7 +376,7 @@ class AllianceRegistration(commands.Cog):
 class _MoveServerView(discord.ui.View):
     def __init__(self, cog: AllianceRegistration, fid: int, caller_id: int,
                  old_server_id, new_server_id):
-        super().__init__(timeout=120)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.fid = fid
         self.caller_id = caller_id

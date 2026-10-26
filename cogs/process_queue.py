@@ -1,6 +1,6 @@
 """
 Persistent process queue with priority and cooperative preemption. Coordinates
-all bulk API operations (gift code redemption, alliance sync, member adds) so
+all bulk API operations (gift code redemption, player sync, member adds) so
 high-priority work interrupts lower-priority work and queued operations
 survive bot restarts.
 """
@@ -19,14 +19,15 @@ logger = logging.getLogger('bot')
 GIFT_VALIDATE = 100
 GIFT_REDEEM = 200
 MEMBER_ADD = 300
-ALLIANCE_CONTROL = 400
-ALLIANCE_SYNC = 500
+PLAYER_SYNC = 500
 STATE_RESOLVE = 600         # slowest work in the bot; always yields to everything else
 
 # Backstop: a handler past this is wedged, not busy. state_resolve runs for hours by
 # design and yields cooperatively instead.
 HANDLER_TIMEOUT_SECONDS = 7200
-HANDLER_TIMEOUT_EXEMPT = ('state_resolve',)
+HANDLER_TIMEOUT_EXEMPT = ('state_resolve', 'api_sync')
+# Handlers that call should_preempt() between steps, so a stop request takes effect mid-run.
+STOPPABLE_ACTIONS = ('gift_redeem', 'member_add', 'state_resolve', 'api_sync')
 
 
 class PreemptedException(Exception):
@@ -44,7 +45,7 @@ class ProcessQueue(commands.Cog):
     Operations are stored as rows in `process_queue` (in db/settings.sqlite)
     with serializable params, so they survive crashes. The processor loop
     always picks the highest-priority queued process. Long-running operations
-    (gift redemption, alliance sync, member add) call `should_preempt()`
+    (gift redemption, player sync, member add) call `should_preempt()`
     between players to yield cooperatively to higher-priority work.
     """
 
@@ -62,6 +63,9 @@ class ProcessQueue(commands.Cog):
         self._processor_task: Optional[asyncio.Task] = None
         self._wake_event = asyncio.Event()
         self._current_process: Optional[Dict] = None
+        self._current_started: Optional[datetime] = None
+        self._cancel_requested: set = set()
+        self._unhandled_warned: set = set()
         self._shutting_down = False
         # Runtime context for non-serializable references (Discord interactions, messages).
         # Lost on restart by design — handlers should fall back gracefully when missing.
@@ -102,6 +106,22 @@ class ProcessQueue(commands.Cog):
         """
         self._handlers[action] = handler
         logger.info(f"ProcessQueue: Registered handler for action '{action}'")
+        self._wake_event.set()
+
+    def _collect_handlers(self):
+        # Handlers live on sibling cogs, so a reloaded queue asks them to register again.
+        for cog in list(self.bot.cogs.values()):
+            register = getattr(cog, 'register_queue_handlers', None)
+            if register is None:
+                continue
+            try:
+                register(self)
+            except Exception as e:
+                logger.error(f"ProcessQueue: {type(cog).__name__} failed to re-register handlers: {e}")
+
+    def _handled_actions_filter(self):
+        actions = tuple(self._handlers)
+        return f" AND action IN ({','.join('?' * len(actions))})", actions
 
     # ── Queue operations ─────────────────────────────────────────────
 
@@ -129,14 +149,15 @@ class ProcessQueue(commands.Cog):
         return process_id
 
     def get_next_queued(self) -> Optional[Dict]:
-        """Get the highest-priority queued process, or None if queue is empty."""
-        self.cursor.execute("""
+        """Get the highest-priority queued process that has a handler, or None."""
+        action_filter, actions = self._handled_actions_filter()
+        self.cursor.execute(f"""
             SELECT id, action, status, priority, alliance_id, details, created_at
             FROM process_queue
-            WHERE status = 'queued'
+            WHERE status = 'queued'{action_filter}
             ORDER BY priority ASC, id ASC
             LIMIT 1
-        """)
+        """, actions)
         row = self.cursor.fetchone()
         if not row:
             return None
@@ -170,6 +191,13 @@ class ProcessQueue(commands.Cog):
     def mark_failed(self, process_id: int):
         self.cursor.execute(
             "UPDATE process_queue SET status = 'failed', completed_at = ? WHERE id = ?",
+            (datetime.now().isoformat(), process_id)
+        )
+        self.conn.commit()
+
+    def mark_cancelled(self, process_id: int):
+        self.cursor.execute(
+            "UPDATE process_queue SET status = 'cancelled', completed_at = ? WHERE id = ?",
             (datetime.now().isoformat(), process_id)
         )
         self.conn.commit()
@@ -217,11 +245,12 @@ class ProcessQueue(commands.Cog):
 
     def has_higher_priority_waiting(self, current_priority: int) -> bool:
         """Check if a higher-priority process is queued (for cooperative preemption)."""
-        self.cursor.execute("""
+        action_filter, actions = self._handled_actions_filter()
+        self.cursor.execute(f"""
             SELECT 1 FROM process_queue
-            WHERE status = 'queued' AND priority < ?
+            WHERE status = 'queued' AND priority < ?{action_filter}
             LIMIT 1
-        """, (current_priority,))
+        """, (current_priority, *actions))
         return self.cursor.fetchone() is not None
 
     def should_preempt(self) -> bool:
@@ -232,7 +261,38 @@ class ProcessQueue(commands.Cog):
         """
         if not self._current_process:
             return False
+        if self._current_process['id'] in self._cancel_requested:
+            return True
         return self.has_higher_priority_waiting(self._current_process['priority'])
+
+    def stop_requested(self) -> bool:
+        """True when an admin asked the running job to stop (it should finish up early)."""
+        return bool(self._current_process) and self._current_process['id'] in self._cancel_requested
+
+    def running_info(self) -> Optional[Dict]:
+        """The running job with its start time, or None when the queue is idle."""
+        if not self._current_process:
+            return None
+        return {**self._current_process, 'started': self._current_started,
+                'stopping': self._current_process['id'] in self._cancel_requested}
+
+    def cancel_process(self, process_id: int) -> str:
+        """'removed' for a queued job, 'stopping' for the running one (it finishes up early at its
+        next check), 'unstoppable' when it can't stop mid-run, 'gone' when it no longer exists."""
+        if self._current_process and self._current_process['id'] == process_id:
+            if self._current_process['action'] not in STOPPABLE_ACTIONS:
+                return 'unstoppable'
+            self._cancel_requested.add(process_id)
+            logger.info(f"ProcessQueue: stop requested for running process id={process_id}")
+            return 'stopping'
+        self.cursor.execute("DELETE FROM process_queue WHERE id = ? AND status = 'queued'", (process_id,))
+        removed = self.cursor.rowcount
+        self.conn.commit()
+        if removed:
+            self.clear_runtime_context(process_id)
+            logger.info(f"ProcessQueue: removed queued process id={process_id}")
+            return 'removed'
+        return 'gone'
 
     def get_queue_info(self) -> Dict:
         """Get queue size and processing state for UI display."""
@@ -243,17 +303,22 @@ class ProcessQueue(commands.Cog):
             'is_processing': self._current_process is not None,
         }
 
-    def get_queued_processes_by_action(self, action: str, statuses=('queued',)) -> list:
-        """Get processes for a given action type. Pass statuses=('queued','active') to
-        include the running one - its details carry live progress."""
+    def queued_processes(self) -> list:
+        """Every waiting job, in the order the processor will run them."""
+        return self.get_queued_processes_by_action(None)
+
+    def get_queued_processes_by_action(self, action: Optional[str], statuses=('queued',)) -> list:
+        """Get processes for a given action type (None = every action). Pass
+        statuses=('queued','active') to include the running one - its details carry live progress."""
         statuses = tuple(statuses)
         placeholders = ",".join("?" for _ in statuses)
+        action_filter = " AND action = ?" if action else ""
         self.cursor.execute(f"""
             SELECT id, action, status, priority, alliance_id, details, created_at
             FROM process_queue
-            WHERE status IN ({placeholders}) AND action = ?
+            WHERE status IN ({placeholders}){action_filter}
             ORDER BY priority ASC, id ASC
-        """, (*statuses, action))
+        """, (*statuses, *([action] if action else [])))
         return [self._row_to_dict(row) for row in self.cursor.fetchall()]
 
     def get_position(self, process_id: int) -> Optional[int]:
@@ -277,19 +342,6 @@ class ProcessQueue(commands.Cog):
         """, (priority, priority, process_id))
         ahead = self.cursor.fetchone()[0] or 0
         return ahead + 1
-
-    def has_queued_or_active(self, action: str, alliance_id: Optional[int] = None) -> bool:
-        if alliance_id is None:
-            self.cursor.execute(
-                "SELECT 1 FROM process_queue WHERE status IN ('queued','active') AND action = ? LIMIT 1",
-                (action,),
-            )
-        else:
-            self.cursor.execute(
-                "SELECT 1 FROM process_queue WHERE status IN ('queued','active') AND action = ? AND alliance_id = ? LIMIT 1",
-                (action, alliance_id),
-            )
-        return self.cursor.fetchone() is not None
 
     # ── Runtime context (non-serializable references) ────────────────
 
@@ -323,6 +375,7 @@ class ProcessQueue(commands.Cog):
                 process = self.get_next_queued()
 
                 if not process:
+                    self._warn_unhandled()
                     # No work — wait for wake signal
                     self._wake_event.clear()
                     try:
@@ -335,17 +388,10 @@ class ProcessQueue(commands.Cog):
                     break
 
                 action = process['action']
-                handler = self._handlers.get(action)
-
-                if not handler:
-                    logger.warning(
-                        f"ProcessQueue: No handler registered for action '{action}' "
-                        f"(id={process['id']}); waiting 5s and retrying"
-                    )
-                    await asyncio.sleep(5)
-                    continue
+                handler = self._handlers[action]
 
                 self._current_process = process
+                self._current_started = datetime.now()
                 self.mark_active(process['id'])
 
                 preempted = False
@@ -364,16 +410,22 @@ class ProcessQueue(commands.Cog):
                     print(msg)
                     self.mark_failed(process['id'])
                 except PreemptedException:
-                    preempted = True
-                    self.requeue(process['id'])
-                    logger.info(f"ProcessQueue: Preempted {action} (id={process['id']}); re-queued for later")
+                    if process['id'] in self._cancel_requested:
+                        self.mark_cancelled(process['id'])
+                        logger.info(f"ProcessQueue: Stopped {action} (id={process['id']}) on admin request")
+                    else:
+                        preempted = True
+                        self.requeue(process['id'])
+                        logger.info(f"ProcessQueue: Preempted {action} (id={process['id']}); re-queued for later")
                 except Exception as e:
                     logger.exception(f"ProcessQueue: Handler for {action} failed (id={process['id']}): {e}")
                     self.mark_failed(process['id'])
                 finally:
                     if not preempted:
                         self.clear_runtime_context(process['id'])
+                    self._cancel_requested.discard(process['id'])
                     self._current_process = None
+                    self._current_started = None
 
             except asyncio.CancelledError:
                 logger.info("ProcessQueue: Processor cancelled")
@@ -381,6 +433,14 @@ class ProcessQueue(commands.Cog):
             except Exception as e:
                 logger.exception(f"ProcessQueue: Processor loop error: {e}")
                 await asyncio.sleep(1)
+
+    def _warn_unhandled(self):
+        self.cursor.execute("SELECT id, action FROM process_queue WHERE status = 'queued'")
+        for process_id, action in self.cursor.fetchall():
+            if action not in self._handlers and process_id not in self._unhandled_warned:
+                self._unhandled_warned.add(process_id)
+                logger.warning(f"ProcessQueue: No handler registered for action '{action}' "
+                               f"(id={process_id}); it waits until one registers")
 
     # ── Crash recovery ───────────────────────────────────────────────
 
@@ -417,6 +477,7 @@ class ProcessQueue(commands.Cog):
         # on_ready, so the processor on_ready normally starts would never run and
         # the queue wedges. When reloaded while already connected, start it here.
         if self.bot.is_ready():
+            self._collect_handlers()
             asyncio.create_task(self._ensure_processor_started())
 
     @commands.Cog.listener()

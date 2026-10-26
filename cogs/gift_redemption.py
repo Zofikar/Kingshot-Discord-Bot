@@ -1,15 +1,14 @@
 """Gift code validation engine, queue system, batch operations, and redemption logic."""
 
 import asyncio
-import base64
 import hashlib
 import json
-import os
 import random
 import re
 import sqlite3
 import time
 import traceback
+from contextlib import closing
 from datetime import datetime, timedelta
 
 import discord
@@ -17,10 +16,11 @@ import requests
 from requests.adapters import HTTPAdapter
 
 from .alliance_member_edit import new_member_name
-from .pimp_my_bot import theme
+from .pimp_my_bot import count_text, plural, theme
 from .browser_headers import get_headers
 from .process_queue import GIFT_VALIDATE, GIFT_REDEEM, PreemptedException
 from . import gift_state_resolver
+from . import onnx_lifecycle
 
 
 async def enqueue_validation(cog, giftcode, source, message=None, channel=None):
@@ -119,19 +119,29 @@ async def handle_member_redeem_process(cog, process):
 
     process_queue = cog.bot.get_cog('ProcessQueue')
     results = {}
+    removals, api_checks = [], []
+    tried = 0
     for done, giftcode in enumerate(codes, start=1):
+        tried = done
         try:
-            status = await claim_giftcode_rewards_wos(cog, fid, giftcode)
+            status = await claim_giftcode_rewards_wos(cog, fid, giftcode, removal_collector=removals,
+                                                      api_checks=api_checks)
         except Exception as e:
             cog.logger.exception(f"GiftOps: catch-up redemption failed for FID {fid}/{giftcode}: {e}")
             status = "ERROR"
         results[status] = results.get(status, 0) + 1
-        # Persist progress so the Member States screens can show a live line.
+        # Persist progress so the Member Kingdoms screens can show a live line.
         if process_queue:
             process_queue.update_details(process['id'], {**details, 'done': done})
+        if status == "STATE_MISMATCH":
+            break   # every other code would be rejected for the same state
 
+    try:
+        await finish_removals(cog, api_checks, removals, confirm=True)
+    except Exception as e:
+        cog.logger.exception(f"GiftOps: catch-up for FID {fid} could not finish its kingdom check: {e}")
     summary = ", ".join(f"{count} {status}" for status, count in sorted(results.items()))
-    cog.logger.info(f"GiftOps: caught FID {fid} ({nickname}) up on {len(codes)} code(s) - {summary}")
+    cog.logger.info(f"GiftOps: caught FID {fid} ({nickname}) up on {tried} of {len(codes)} code(s) - {summary}")
 
 
 # Shown when a new code can't be confirmed yet; schedule_revalidation re-tests it within minutes.
@@ -729,6 +739,19 @@ async def get_user_kid(cog, fid):
     return await asyncio.to_thread(_query)
 
 
+async def resolve_periodic_validation_fid(cog):
+    """Validation ID for the periodic loop; one with no state on file is swapped for a member that has one."""
+    fid, source = await cog.get_validation_fid()
+    if await get_user_kid(cog, fid) is not None:
+        return fid, source
+    alts = await get_alt_validation_fids(cog, exclude={fid}, limit=1)
+    if not alts:
+        cog.logger.warning(f"GiftOps: Validation ID {fid} has no state on file and no alliance member has one; skipping periodic validation.")
+        return None, source
+    cog.logger.warning(f"GiftOps: Validation ID {fid} has no state on file; validating with member ID {alts[0]} instead.")
+    return alts[0], "alliance_member"
+
+
 async def get_alt_validation_fids(cog, exclude, limit=3):
     """Random alliance-member FIDs to validate with when the primary FID is dead.
     Only members with a known kingdom (kid) — redemption needs it now."""
@@ -1082,39 +1105,6 @@ def batch_process_alliance_results(cog, results_batch):
         cog.logger.exception(f"GiftOps: Error in batch_process_alliance_results: {e}")
 
 
-async def get_stove_info_wos(cog, player_id):
-    session = requests.Session()
-    session.mount("https://", HTTPAdapter(max_retries=cog.retry_config))
-    session.headers.update(get_headers(cog.wos_giftcode_redemption_url))
-
-    data_to_encode = {
-        "fid": f"{player_id}",
-        "time": f"{int(datetime.now().timestamp())}",
-    }
-    data = encode_data(cog, data_to_encode)
-
-    try:
-        response_stove_info = await asyncio.to_thread(
-            session.post,
-            cog.wos_player_info_url,
-            data=data,
-            timeout=(10, 30),
-        )
-        return session, response_stove_info
-    except requests.exceptions.ConnectionError as e:
-        session.close()
-        cog.logger.warning(f"Connection error reaching Kingshot API for player {player_id}: {type(e).__name__}")
-        raise
-    except requests.exceptions.Timeout as e:
-        session.close()
-        cog.logger.warning(f"Timeout reaching Kingshot API for player {player_id}")
-        raise
-    except requests.exceptions.RequestException as e:
-        session.close()
-        cog.logger.warning(f"Request error reaching Kingshot API for player {player_id}: {type(e).__name__}")
-        raise
-
-
 async def redeem_giftcode_once(cog, player_id, giftcode, kid, session):
     """Redeem one code for a player in kingdom `kid`; returns a status string."""
     data_to_encode = {
@@ -1142,7 +1132,7 @@ async def redeem_giftcode_once(cog, player_id, giftcode, kid, session):
     note_rate_limit(cog, response_giftcode)
 
     # Upstream hiccup: hand back to the retry cycle rather than mark the member failed.
-    if response_giftcode.status_code in (429, 502, 503, 504):
+    if response_giftcode.status_code in (429, 500, 502, 503, 504):
         cog.logger.warning(f"GiftOps: HTTP {response_giftcode.status_code} redeeming for ID {player_id} - will retry")
         return "TIMEOUT_RETRY"
 
@@ -1189,12 +1179,194 @@ async def redeem_giftcode_once(cog, player_id, giftcode, kid, session):
         return "UNKNOWN_API_RESPONSE"
 
 
-def _state_resolve_targets(scope):
-    """The FIDs a state_resolve job covers: members the game rejected, or members with
-    no state at all."""
-    if scope == 'missing':
-        return gift_state_resolver.fids_missing_state()
-    return [row[0] for row in gift_state_resolver.fids_with_state_mismatch()]
+SCAN_MODES = {'now': (6, 2.2), 'auto': (1, 10.0)}   # (members at once, seconds between probes)
+AUTO_SCAN_HEADROOM = 10                               # API requests auto-scan leaves for redemption
+SAVE_ATTEMPTS = 3
+
+
+def _auto_should_wait(cog):
+    """Auto-scan waits while OCR runs or the shared API budget is nearly spent."""
+    if onnx_lifecycle.any_model_in_use():
+        return True
+    remaining = getattr(cog, "rate_limit_remaining", None)
+    started = getattr(cog, "rate_limit_window_started", None)
+    return (remaining is not None and remaining < AUTO_SCAN_HEADROOM and started is not None
+            and time.time() < started + RATE_LIMIT_WINDOW)
+
+
+async def save_found_kingdom(cog, fid, kid):
+    """Store a found kingdom right away. A locked DB is retried; a lost save costs one rescan."""
+    for attempt in range(SAVE_ATTEMPTS):
+        try:
+            await asyncio.to_thread(gift_state_resolver.set_user_kid, fid, kid)
+            return True
+        except sqlite3.OperationalError as e:
+            cog.logger.warning(f"GiftOps: saving kingdom {kid} for FID {fid} failed "
+                               f"(attempt {attempt + 1}/{SAVE_ATTEMPTS}): {e}")
+            if attempt + 1 < SAVE_ATTEMPTS:
+                await asyncio.sleep(5 * (attempt + 1))
+    msg = f"GiftOps: could not save kingdom {kid} for FID {fid}; it will be scanned again"
+    cog.logger.error(msg)
+    print(msg)
+    return False
+
+
+API_LIMIT_PROGRESS = ("Your API's daily request limit is reached. The scan continues tomorrow with the "
+                      "members it hasn't looked up yet.")
+API_LIMIT_NOW_RUN = ("Your API's daily request limit is reached. Press Scan These Now again tomorrow, "
+                     "or switch Kingdom Scan on and it continues by itself.")
+API_LIMIT_SCAN_NOW = ("Your API's daily request limit is reached. Press Scan These Now again tomorrow, "
+                      "when the limit resets.")
+
+
+async def store_found_state(cog, fid, kid):
+    """Save a found state and catch the member up on missed codes; False when the save failed."""
+    if not await save_found_kingdom(cog, fid, kid):
+        return False
+    try:
+        enqueue_member_redemption(cog, fid)
+    except Exception as e:
+        cog.logger.exception(f"GiftOps: could not queue catch-up for FID {fid}: {e}")
+    return True
+
+
+async def apply_api_state(cog, fid, kid, collector, alliance_id=None):
+    """A new state the API found for `fid`: leaving a single-state alliance with Auto-remove on makes
+    them a removal candidate in `collector` ('candidate'), anything else is saved ('saved').
+    None when the save failed."""
+    if alliance_id is None:
+        alliance_id = await asyncio.to_thread(gift_state_resolver.get_member_alliance, fid)
+    if await asyncio.to_thread(gift_state_resolver.left_alliance_state, alliance_id, kid):
+        if await maybe_remove_transferred_member(cog, fid, collector):
+            return 'candidate'
+    return 'saved' if await store_found_state(cog, fid, kid) else None
+
+
+async def _ask_api_for_state(cog, fid, collector):
+    """('found', kid), ('candidate', None) for an Auto-remove candidate, ('miss', None) once the API
+    was asked, ('retry', None) after a DB error, or ('limit', None) when today's request limit
+    stopped the lookup."""
+    from . import alliance_api_sync
+    if not await _still_needs_scan(fid):
+        return 'miss', None
+    lookup = await alliance_api_sync.lookup_via_bot(cog.bot, fid)
+    if lookup.reason == alliance_api_sync.BUDGET_SPENT:
+        return 'limit', None
+    kid = lookup.kid
+    if kid is None:
+        return 'miss', None
+    try:
+        needed, rejected, alliance_id = await asyncio.to_thread(gift_state_resolver.scan_check, fid)
+    except sqlite3.Error as e:
+        cog.logger.warning(f"GiftOps: could not check FID {fid} after its API lookup: {e}")
+        return 'retry', None
+    if not needed or kid == rejected:
+        return 'miss', None     # fixed meanwhile, or repeats the state the game rejected; the probe decides
+    outcome = await apply_api_state(cog, fid, kid, collector, alliance_id)
+    if outcome is None:
+        return 'retry', None
+    return ('found', kid) if outcome == 'saved' else ('candidate', None)
+
+
+async def _resolve_through_api(cog, details, remaining, found_states, check_yield, save, progress):
+    """Place members through Player Sync's API before any probing. Returns the members that may be
+    probed: everyone without the API, else only those the API was asked about and couldn't place."""
+    from . import alliance_api_sync
+    if not await alliance_api_sync.api_available_async():
+        return set(remaining)
+    checked = details.setdefault('api_checked', [])
+    details['limit_reached'] = False
+    unasked = [f for f in remaining if f not in checked]
+    if unasked:
+        await progress.update(unasked[0], f"{theme.hourglassIcon} Looking up `{len(unasked)}` "
+                                          f"{plural(len(unasked), 'member')} through your API...")
+    removals = []
+    try:
+        for fid in unasked:
+            await check_yield()
+            outcome, kid = await _ask_api_for_state(cog, fid, removals)
+            if outcome == 'limit':
+                details['limit_reached'] = True
+                break
+            if outcome == 'found':
+                remaining.remove(fid)
+                progress.checked += 1
+                details['resolved'] += 1
+                details['api_found'] = details.get('api_found', 0) + 1
+                if kid not in found_states:
+                    found_states.insert(0, kid)
+            elif outcome == 'candidate':
+                remaining.remove(fid)
+                progress.checked += 1
+            elif outcome == 'miss':
+                checked.append(fid)
+            save()
+    finally:
+        await _apply_scan_removals(cog, removals)
+    save()
+    cog.logger.info(f"GiftOps: kingdom scan placed {details.get('api_found', 0)} member(s) through the API"
+                    + (", daily request limit reached" if details['limit_reached'] else ""))
+    return set(checked)
+
+
+async def _apply_scan_removals(cog, removals):
+    """Never lets a removal failure replace the scan's own exception."""
+    if not removals:
+        return
+    try:
+        await apply_removals(cog, removals)
+    except Exception as e:
+        cog.logger.exception(f"GiftOps: kingdom scan could not apply its auto-removals: {e}")
+
+
+async def _quietly(cog, fn, *args):
+    """Scan bookkeeping is best-effort: a locked DB here only costs resume precision."""
+    try:
+        await asyncio.to_thread(fn, *args)
+    except sqlite3.Error as e:
+        cog.logger.warning(f"GiftOps: kingdom scan bookkeeping failed ({fn.__name__}): {e}")
+
+
+class _FixedMeanwhile(Exception):
+    """An admin set the member's state while their scan was running."""
+
+
+async def _still_needs_scan(fid):
+    try:
+        return await asyncio.to_thread(gift_state_resolver.needs_scan, fid)
+    except sqlite3.Error:
+        return True  # can't tell; keep scanning rather than drop the member
+
+
+async def scan_one_member(cog, fid, *, mode, settings, wait_until_idle, prefer, on_progress):
+    """Scan one member and store the result at once. Returns the kingdom found or None."""
+    if not await _still_needs_scan(fid):
+        return None
+    _concurrency, pace = SCAN_MODES[mode]
+    lo, hi = settings['min'], settings['max']
+    start_at = await asyncio.to_thread(gift_state_resolver.get_scan_position, fid)
+    if start_at is not None and not lo <= start_at <= hi:
+        start_at = None  # the default range moved since it was saved
+
+    async def checkpoint(next_kid):
+        if not await _still_needs_scan(fid):
+            raise _FixedMeanwhile(fid)
+        await _quietly(cog, gift_state_resolver.save_scan_position, fid, next_kid)
+
+    try:
+        kid = await gift_state_resolver.resolve_state(
+            cog, fid, scan_range=(lo, hi), start_at=start_at, pace=pace,
+            wait_until_idle=wait_until_idle, on_progress=on_progress, on_checkpoint=checkpoint,
+            prefer=prefer)
+    except _FixedMeanwhile:
+        cog.logger.info(f"GiftOps: FID {fid} was given a kingdom by hand; stopping its scan")
+        return None
+    if not await _still_needs_scan(fid):
+        return None  # set by hand during the last stretch; never overwrite an admin's value
+    if kid is None:
+        await _quietly(cog, gift_state_resolver.mark_scan_done, fid)
+        return None
+    return kid if await store_found_state(cog, fid, kid) else None
 
 
 class _StateScanProgress:
@@ -1205,8 +1377,9 @@ class _StateScanProgress:
     resume after a restart or a preemption keeps editing the same message instead of
     posting a new one. `on_post` is called whenever that mapping changes so it gets saved."""
 
-    def __init__(self, cog, total, posted=None, on_post=None):
+    def __init__(self, cog, total, posted=None, on_post=None, quiet=False):
         self.cog = cog
+        self.quiet = quiet      # auto-scan runs often; it reports in Kingdom Scan, not the logs
         self.total = total
         self.posted = posted if posted is not None else {}
         self.on_post = on_post
@@ -1265,7 +1438,7 @@ class _StateScanProgress:
     async def update(self, fid, body):
         """Post or edit that member's alliance log message with `body`."""
         alliance_id, nickname = await asyncio.to_thread(self._member_info, fid)
-        if alliance_id is None:
+        if alliance_id is None or self.quiet:
             return nickname
         embed = discord.Embed(
             title=f"{theme.searchIcon} Detecting Member Kingdoms",
@@ -1308,42 +1481,104 @@ class _StateScanProgress:
 
 
 async def handle_state_resolve_process(cog, process):
-    """ProcessQueue handler for state_resolve: probe each member's real state.
-    Lowest priority in the bot - yields before every probe and resumes where it left off."""
+    """ProcessQueue handler for the kingdom scan. Lowest priority in the bot: yields before
+    every probe; each member's resume point lives in users, so even a failed run resumes."""
     process_queue_cog = cog.bot.get_cog('ProcessQueue')
     details = dict(process.get('details') or {})
-    scope = details.get('scope', 'mismatch')
+    mode = details.get('mode', 'now')
+    concurrency, _pace = SCAN_MODES[mode]
+    settings = await asyncio.to_thread(gift_state_resolver.get_scan_settings)
 
     if 'remaining' not in details:
-        details['remaining'] = await asyncio.to_thread(_state_resolve_targets, scope)
+        details['remaining'] = await asyncio.to_thread(
+            gift_state_resolver.scan_targets, auto=(mode == 'auto'))
         details['total'] = len(details['remaining'])
-        details['resolved'] = 0
-        details['unresolved'] = 0
+    details.setdefault('resolved', 0)
+    details.setdefault('unresolved', 0)
+    details['started'] = True  # tells the menu "paused" apart from "not started yet"
 
     remaining = list(details['remaining'])
     cog.logger.info(
-        f"GiftOps: state_resolve ({scope}) running - {len(remaining)} of "
+        f"GiftOps: kingdom scan ({mode}) running - {len(remaining)} of "
         f"{details['total']} member(s) still to check"
     )
 
-    def _should_stop():
-        return bool(process_queue_cog and process_queue_cog.should_preempt())
+    switched_off = stopped_by_admin = False
+
+    async def _check_yield():
+        nonlocal switched_off, stopped_by_admin
+        if process_queue_cog and process_queue_cog.stop_requested():
+            stopped_by_admin = True
+            raise gift_state_resolver.StateResolveInterrupted(None)
+        if mode == 'auto' and not await asyncio.to_thread(gift_state_resolver.scan_enabled):
+            switched_off = True
+            raise gift_state_resolver.StateResolveInterrupted(None)
+        if process_queue_cog and process_queue_cog.should_preempt():
+            raise gift_state_resolver.StateResolveInterrupted(None)
+
+    async def _wait_until_idle():
+        await _check_yield()
+        if mode != 'auto' or not _auto_should_wait(cog):
+            return
+        details['waiting'] = True  # shown in the menu while it waits
+        _save()
+        try:
+            while _auto_should_wait(cog):
+                await asyncio.sleep(15)
+                await _check_yield()
+        finally:
+            details['waiting'] = False
+            _save()
 
     def _save():
         details['remaining'] = remaining
-        if process_queue_cog:
+        if not process_queue_cog:
+            return
+        try:
             process_queue_cog.update_details(process['id'], details)
+        except sqlite3.Error as e:
+            cog.logger.warning(f"GiftOps: could not save kingdom scan progress: {e}")
 
     details.setdefault('progress_msgs', {})
-    progress = _StateScanProgress(cog, details['total'],
-                                  posted=details['progress_msgs'], on_post=_save)
+    progress = _StateScanProgress(cog, details['total'], posted=details['progress_msgs'],
+                                  on_post=_save, quiet=(mode == 'auto'))
     progress.checked = details['total'] - len(remaining)
+
+    async def _halt(lead_fid):
+        """End an interrupted run; raises PreemptedException when it should resume later."""
+        if stopped_by_admin:
+            await progress.update(
+                lead_fid, f"{theme.infoIcon} Stopped by an admin. "
+                          f"`{len(remaining)}` {plural(len(remaining), 'member')} still to check.")
+            cog.logger.info(f"GiftOps: kingdom scan stopped by an admin - {len(remaining)} member(s) left")
+            return
+        if switched_off:
+            cog.logger.info(f"GiftOps: auto-scan switched off - stopping with "
+                            f"{len(remaining)} member(s) left")
+            return
+        await progress.update(
+            lead_fid, f"{theme.infoIcon} Paused while other work runs. "
+                      f"`{len(remaining)}` {plural(len(remaining), 'member')} left.")
+        cog.logger.info(f"GiftOps: kingdom scan paused for higher-priority work - "
+                        f"{len(remaining)} member(s) left")
+        raise PreemptedException()
 
     # Fed to the next wave as first guesses.
     found_states = list(details.get('found_states') or [])
 
-    while remaining:
-        wave = remaining[:gift_state_resolver.SCAN_CONCURRENCY]
+    try:
+        may_probe = await _resolve_through_api(cog, details, remaining, found_states, _check_yield, _save,
+                                               progress)
+    except gift_state_resolver.StateResolveInterrupted:
+        details['found_states'] = found_states[:5]
+        _save()
+        await _halt(remaining[0] if remaining else None)
+        return
+    details['found_states'] = found_states[:5]
+    probing = [f for f in remaining if f in may_probe]
+
+    while probing:
+        wave = probing[:concurrency]
         lead_name = await progress.update(
             wave[0], f"{theme.hourglassIcon} Scanning `{len(wave)}` member(s) at once...")
 
@@ -1355,9 +1590,8 @@ async def handle_state_resolve_process(cog, process):
                       f"`{done}/{of_total}` kingdoms checked for **{_name}**")
 
         results = await asyncio.gather(*(
-            gift_state_resolver.resolve_state(
-                cog, f, should_stop=_should_stop, prefer=found_states,
-                on_progress=_on_probe if f == wave[0] else None)
+            scan_one_member(cog, f, mode=mode, settings=settings, wait_until_idle=_wait_until_idle,
+                            prefer=found_states, on_progress=_on_probe if f == wave[0] else None)
             for f in wave
         ), return_exceptions=True)
 
@@ -1365,16 +1599,16 @@ async def handle_state_resolve_process(cog, process):
         for fid, result in zip(wave, results):
             if isinstance(result, gift_state_resolver.StateResolveInterrupted):
                 interrupted = True
-                continue                      # stays in `remaining`, retried on resume
+                continue                      # stays in `remaining`, resumes from its saved point
             if isinstance(result, BaseException):
-                cog.logger.warning(f"GiftOps: state resolve failed for FID {fid}: {result}")
+                cog.logger.warning(f"GiftOps: kingdom scan failed for FID {fid}: {result}")
                 result = None
             remaining.remove(fid)
+            probing.remove(fid)
             progress.checked += 1
             if result is None:
                 details['unresolved'] += 1
                 continue
-            await asyncio.to_thread(gift_state_resolver.set_user_kid, fid, result)
             details['resolved'] += 1
             if result not in found_states:
                 found_states.insert(0, result)
@@ -1384,51 +1618,61 @@ async def handle_state_resolve_process(cog, process):
         details.pop('probe_total', None)
         _save()
 
-        # Before bailing out: these are off `remaining`, so a skip loses them forever.
-        for fid, result in zip(wave, results):
-            if isinstance(result, int):
-                try:
-                    enqueue_member_redemption(cog, fid)
-                except Exception as e:
-                    cog.logger.exception(f"GiftOps: could not queue catch-up for FID {fid}: {e}")
-
         if interrupted:
-            await progress.update(
-                wave[0], f"{theme.infoIcon} Paused while gift codes redeem. "
-                         f"`{len(remaining)}` member(s) left.")
-            cog.logger.info(f"GiftOps: state_resolve paused for higher-priority work - "
-                            f"{len(remaining)} member(s) left")
-            raise PreemptedException()
+            await _halt(wave[0])
+            return
 
         await progress.update(
             wave[0], f"{theme.verifiedIcon} `{details['resolved']}` found, "
                      f"`{details['unresolved']}` still unknown.")
 
+    if details.get('limit_reached') and remaining:
+        details['not_looked_up'] = len(remaining)
+        _save()
+        limit_text = API_LIMIT_NOW_RUN if mode == 'now' else API_LIMIT_PROGRESS
+        await progress.update(remaining[0], f"{theme.infoIcon} {limit_text}")
+        cog.logger.info(f"GiftOps: kingdom scan ({mode}) stopped at the API's daily request limit - "
+                        f"{len(remaining)} member(s) not looked up yet")
+        if mode == 'now':
+            await _notify_state_resolve_done(cog, details)
+        return
+
     cog.logger.info(
-        f"GiftOps: state_resolve ({scope}) complete - fixed {details['resolved']}, "
+        f"GiftOps: kingdom scan ({mode}) complete - found {details['resolved']}, "
         f"still unknown {details['unresolved']}, of {details['total']} member(s)"
     )
     await progress.finish(details['resolved'], details['unresolved'])
-    await _notify_state_resolve_done(cog, scope, details)
+    if mode == 'now':
+        await _notify_state_resolve_done(cog, details)
 
 
-async def _notify_state_resolve_done(cog, scope, details):
-    """DM global admins the outcome - the job runs for hours, nobody is watching a screen."""
+async def _notify_state_resolve_done(cog, details):
+    """DM global admins the outcome - the scan runs for hours, nobody is watching a screen."""
     if not details.get('total'):
         return
     unresolved = details.get('unresolved', 0)
+    used_api = 'api_checked' in details
+    unknown = ("Your API and the scan couldn't place the members still unknown. They may have left "
+               "the game or be in a kingdom outside the scan range." if used_api else
+               "Members still unknown have either left the game or are in a kingdom outside the scan range.")
     tail = (
-        f"\n\n{theme.infoIcon} The {unresolved} still unknown either left the game or moved "
-        f"far outside their old kingdom. Remove them, or set a kingdom by hand in **Member Kingdoms**."
+        f"\n\n{theme.infoIcon} {unknown} Remove them, widen the range under **Kingdom Scan**, "
+        f"or set a kingdom by hand under **Members to Fix**."
         if unresolved else ""
     )
-    label = "members with no kingdom" if scope == 'missing' else "members the game rejected"
+    via_api = f" ({details.get('api_found', 0)} through your API)" if used_api else ""
+    waiting = details.get('not_looked_up', 0) if details.get('limit_reached') else 0
+    if waiting:
+        tail += (f"\n\n{theme.infoIcon} Your API's daily request limit was reached, so `{waiting}` "
+                 f"{plural(waiting, 'member')} weren't looked up yet. Press **Scan These Now** "
+                 f"again tomorrow, or switch **Kingdom Scan** on and it continues by itself.")
     embed = discord.Embed(
-        title=f"{theme.verifiedIcon} Kingdom Resolution Finished",
+        title=f"{theme.verifiedIcon} Kingdom Scan Finished",
         description=(
-            f"Checked {details['total']} {label}.\n\n"
+            f"Checked {count_text(details['total'], 'member')} "
+            f"with a missing or wrong kingdom.\n\n"
             f"{theme.upperDivider}\n"
-            f"{theme.verifiedIcon} **Kingdoms fixed:** `{details.get('resolved', 0)}`\n"
+            f"{theme.verifiedIcon} **Kingdoms found:** `{details.get('resolved', 0)}`{via_api}\n"
             f"{theme.deniedIcon} **Still unknown:** `{unresolved}`\n"
             f"{theme.lowerDivider}{tail}"
         ),
@@ -1437,7 +1681,7 @@ async def _notify_state_resolve_done(cog, scope, details):
     try:
         await _dm_global_admins(cog, embed)
     except Exception as e:
-        cog.logger.exception(f"GiftOps: could not DM the state resolution result: {e}")
+        cog.logger.exception(f"GiftOps: could not DM the kingdom scan result: {e}")
 
 
 # An alliance losing this share of its roster in one run is far more likely to be an
@@ -1446,27 +1690,28 @@ AUTO_REMOVE_MAX_SHARE = 0.20
 AUTO_REMOVE_MIN_TO_GUARD = 3
 
 
+def auto_remove_on(alliance_id):
+    """True when the single-kingdom alliance removes members who transfer out of its kingdom."""
+    if gift_state_resolver.is_multistate(alliance_id):
+        return False
+    with closing(sqlite3.connect('db/alliance.sqlite', timeout=30.0)) as conn:
+        row = conn.execute("SELECT auto_remove_on_transfer FROM alliancesettings WHERE alliance_id = ?",
+                           (alliance_id,)).fetchone()
+    return bool(row and row[0])
+
+
 async def maybe_remove_transferred_member(cog, fid, collector=None):
     """Record a member who transferred out of their single-kingdom alliance, if it opted in
     (auto_remove_on_transfer). Nothing is deleted here; apply_removals decides. Pass
     `collector` during a bulk run to batch the notices."""
     def _candidate():
-        with sqlite3.connect('db/users.sqlite', timeout=30.0) as conn:
+        with closing(sqlite3.connect('db/users.sqlite', timeout=30.0)) as conn:
             row = conn.execute(
                 "SELECT alliance, nickname FROM users WHERE fid = ?", (fid,)).fetchone()
-            alliance_id = row[0] if row and row[0] is not None else None
-            if alliance_id is None:
-                return None
-            if gift_state_resolver.is_multistate(alliance_id):
-                return None
-            with sqlite3.connect('db/alliance.sqlite', timeout=30.0) as aconn:
-                srow = aconn.execute(
-                    "SELECT auto_remove_on_transfer FROM alliancesettings WHERE alliance_id = ?",
-                    (alliance_id,),
-                ).fetchone()
-            if not (srow and srow[0]):
-                return None
-            return alliance_id, (row[1] or str(fid))
+        alliance_id = row[0] if row and row[0] is not None else None
+        if alliance_id is None or not auto_remove_on(alliance_id):
+            return None
+        return alliance_id, (row[1] or str(fid))
 
     found = await asyncio.to_thread(_candidate)
     if found is None:
@@ -1479,10 +1724,104 @@ async def maybe_remove_transferred_member(cog, fid, collector=None):
     return True
 
 
+async def handle_state_mismatch(cog, fid, kid, collector=None, api_checks=None):
+    """The game rejected `kid`: auto-remove or flag the member. With the API set up, every rejected
+    member goes into `api_checks` once per run; confirm_mismatches asks after the run, so
+    redemption never waits on the API and nobody is removed without the API's word."""
+    from . import alliance_api_sync
+    if (api_checks is not None and all(fid != checked for checked, _ in api_checks)
+            and await alliance_api_sync.api_available_async()):
+        api_checks.append((fid, kid))
+    if not await maybe_remove_transferred_member(cog, fid, collector):
+        await asyncio.to_thread(gift_state_resolver.flag_state_mismatch, fid)
+        cog.logger.info(f"GiftOps: flagged FID {fid} for a wrong kingdom (was {kid}); "
+                        f"fix it under Member Kingdoms -> Members to Fix.")
+
+
+def _confirms_transfer(fid, kid, collector):
+    """The API repeats the rejected kingdom: a transfer only when that kingdom is outside the alliance's."""
+    return (any(candidate[1] == fid for candidate in collector)
+            and gift_state_resolver.left_alliance_state(gift_state_resolver.get_member_alliance(fid), kid))
+
+
+async def _confirm_one(cog, fid, kid, new_kid, collector):
+    """True when the API confirmed `fid` left the alliance's kingdom and they stay a removal candidate."""
+    if new_kid == kid:
+        return await asyncio.to_thread(_confirms_transfer, fid, kid, collector)
+    cog.logger.info(f"GiftOps: the API places FID {fid} in kingdom {new_kid}, not {kid}")
+    collector[:] = [candidate for candidate in collector if candidate[1] != fid]
+    outcome = await apply_api_state(cog, fid, new_kid, collector)
+    if outcome is None:
+        await asyncio.to_thread(gift_state_resolver.flag_state_mismatch, fid)
+    return outcome == 'candidate'
+
+
+async def confirm_mismatches(cog, api_checks, collector):
+    """Ask Player Sync's API about the members a run rejected, before its removals are applied.
+    A new kingdom replaces the flag or removal candidate. A candidate the API didn't confirm outside
+    the alliance's kingdom is held and flagged, never removed."""
+    from . import alliance_api_sync
+    if not api_checks:
+        return
+    confirmed = set()
+    asking = await alliance_api_sync.api_available_async()
+    for fid, kid in api_checks:
+        if not asking:
+            break
+        lookup = await alliance_api_sync.lookup_via_bot(cog.bot, fid)
+        if lookup.failed:
+            cog.logger.warning("GiftOps: the API isn't answering; the other rejected members are held")
+            break
+        new_kid = lookup.kid
+        if new_kid is None:
+            continue
+        try:
+            if await _confirm_one(cog, fid, kid, new_kid, collector):
+                confirmed.add(fid)
+        except sqlite3.Error as e:
+            cog.logger.warning(f"GiftOps: could not apply the API's kingdom for FID {fid}: {e}")
+    await hold_unconfirmed(cog, [check for check in api_checks if check[0] not in confirmed], collector)
+
+
+async def hold_unconfirmed(cog, api_checks, collector):
+    """Removal candidates among `api_checks` are flagged instead of removed, so a stale kingdom never
+    deletes anyone without the API's word. `api_checks` is only filled when the API is set up."""
+    unconfirmed = {fid for fid, _ in api_checks}
+    held = [fid for _, fid, _ in collector if fid in unconfirmed]
+    if not held:
+        return
+    collector[:] = [candidate for candidate in collector if candidate[1] not in unconfirmed]
+    await asyncio.to_thread(gift_state_resolver.flag_state_mismatch_many, held)
+    cog.logger.info(f"GiftOps: {len(held)} rejected member(s) flagged instead of removed; "
+                    f"the API didn't confirm they left")
+
+
+async def finish_removals(cog, api_checks, removals, *, confirm):
+    """End of a redemption run: with `confirm` the API is asked first, else the unconfirmed are only
+    held; then the remaining candidates go through apply_removals and its roster guard."""
+    if confirm:
+        await confirm_mismatches(cog, api_checks, removals)
+    else:
+        await hold_unconfirmed(cog, api_checks, removals)
+    if removals:
+        await apply_removals(cog, removals)
+
+
+def state_mismatch_note(api_on):
+    """The redemption summary's line for members whose kingdom was rejected; `{count}` is filled in later."""
+    lead = (f"{theme.globeIcon} **" + "{count}" + "** members are hiding out in the wrong kingdom - "
+            f"the game wasn't fooled. ")
+    if api_on:
+        return (lead + "Members your API finds in a new kingdom are updated, and anyone still in this "
+                "alliance gets the code shortly. Fix the rest under "
+                "Alliance Management -> Member Kingdoms -> Members to Fix.")
+    return lead + "Update their kingdom and the rewards will follow."
+
+
 async def apply_removals(cog, candidates):
-    """Delete the collected transfer candidates, one decision per alliance. An alliance that
-    would lose more than AUTO_REMOVE_MAX_SHARE of its roster keeps every member; they are
-    flagged wrong-kingdom instead, so a bad API run cannot empty a roster."""
+    """Delete the collected transfer candidates, one decision per alliance, and return those
+    removed. An alliance that would lose more than AUTO_REMOVE_MAX_SHARE of its roster keeps
+    every member; they are flagged wrong-kingdom instead, so a bad API run cannot empty a roster."""
     by_alliance = {}
     for alliance_id, fid, nickname in candidates:
         by_alliance.setdefault(alliance_id, []).append((fid, nickname))
@@ -1519,6 +1858,7 @@ async def apply_removals(cog, candidates):
 
     if removed:
         await post_removal_summary(cog, removed)
+    return removed
 
 
 def _alliance_log_channel(cog, alliance_id):
@@ -1543,12 +1883,12 @@ async def post_removal_blocked(cog, alliance_id, flagged, roster):
             title=f"{theme.warnIcon} Auto-removal Held Back",
             description=(
                 f"{flagged} of {roster} members looked like they had left this alliance's "
-                f"kingdom during the last redemption, so nobody was removed.\n"
+                f"kingdom, so nobody was removed to be safe.\n"
                 f"{theme.upperDivider}\n"
-                f"That many at once usually means the Gift Redemption API was misreporting, "
-                f"not that your alliance emptied. The members are flagged instead, so you can "
-                f"check them under **Member States -> Wrong States** and clear them from there "
-                f"if the transfers were real.\n{theme.lowerDivider}"
+                f"That many at once usually means the player data was wrong, not that people "
+                f"left. They're flagged instead, so you can check them under "
+                f"**Member Kingdoms -> Members to Fix** and remove anyone who really moved by hand.\n"
+                f"{theme.lowerDivider}"
             ),
             color=theme.emColor1,
         )
@@ -1587,7 +1927,7 @@ async def post_removal_summary(cog, removals):
 
 
 async def claim_giftcode_rewards_wos(cog, player_id, giftcode, *, skip_cache: bool = False,
-                                     removal_collector=None):
+                                     removal_collector=None, api_checks=None):
     """Redeem `giftcode` for `player_id` via the Kingshot Gift Code API.
 
     By default we short-circuit on a cached prior result so we don't
@@ -1635,16 +1975,10 @@ async def claim_giftcode_rewards_wos(cog, player_id, giftcode, *, skip_cache: bo
         await await_rate_limit(cog)  # shared per-IP budget: every path waits it out
         status = await redeem_giftcode_once(cog, player_id, giftcode, kid, session)
 
-        # Stale kingdom (member transferred): flag for the admin. Re-probing the game here
-        # costs ~400 paced requests (25+ min) and would stall the whole redemption queue,
-        # so it only ever runs as the separate, preemptible state_resolve job.
+        # No re-probing here: it would stall the queue 25+ min per member, so
+        # detection runs as the separate preemptible state_resolve job.
         if status == "STATE_MISMATCH" and player_id != cog.get_test_fid():
-            if not await maybe_remove_transferred_member(cog, player_id, removal_collector):
-                await asyncio.to_thread(gift_state_resolver.flag_state_mismatch, player_id)
-                cog.logger.info(
-                    f"GiftOps: flagged FID {player_id} for a wrong kingdom (was {kid}); "
-                    f"fix it in Member Kingdoms or run Detect These Kingdoms."
-                )
+            await handle_state_mismatch(cog, player_id, kid, removal_collector, api_checks)
 
         # Handle database updates for successful redemptions
         if player_id != cog.get_test_fid() and status in ["SUCCESS", "RECEIVED", "SAME TYPE EXCHANGE"]:
@@ -1721,9 +2055,23 @@ def _extract_embed_codes(message) -> list:
 
     codes = []
     for text in texts:
-        clean = str(text).replace('*', '').replace('`', '').replace('_', '')
-        codes.extend(m.group(1) for m in re.finditer(r'Code:\s*([a-zA-Z0-9]+)', clean, re.IGNORECASE))
+        codes.extend(m.group(1) for m in re.finditer(r'Code:\s*([a-zA-Z0-9]+)', _strip_markdown(text), re.IGNORECASE))
     return codes
+
+
+def _strip_markdown(text) -> str:
+    return str(text).replace('*', '').replace('`', '').replace('_', '')
+
+
+def _extract_content_codes(content: str) -> list:
+    """Code candidates in message text: a lone alphanumeric word, or a Code:-labeled one."""
+    clean = _strip_markdown(content).strip()
+    if not clean:
+        return []
+    if len(clean.split()) == 1:
+        return [clean] if re.match(r'^[a-zA-Z0-9]+$', clean) else []
+    code_match = re.search(r'Code:\s*([a-zA-Z0-9]+)(?!\S)', clean, re.IGNORECASE)
+    return [code_match.group(1)] if code_match else []
 
 
 async def scan_historical_messages(cog, channel: discord.TextChannel, alliance_id: int) -> dict:
@@ -1773,20 +2121,7 @@ async def scan_historical_messages(cog, channel: discord.TextChannel, alliance_i
         message_code_map = {}
 
         for message in messages_to_process:
-            candidates = []
-            content = message.content.strip()
-
-            # Check for gift code patterns
-            if content:
-                if len(content.split()) == 1:
-                    if re.match(r'^[a-zA-Z0-9]+$', content):
-                        candidates.append(content)
-                else:
-                    code_match = re.search(r'Code:\s*(\S+)', content, re.IGNORECASE)
-                    if code_match:
-                        potential_code = code_match.group(1)
-                        if re.match(r'^[a-zA-Z0-9]+$', potential_code):
-                            candidates.append(potential_code)
+            candidates = _extract_content_codes(message.content)
 
             # Official codes usually arrive inside embeds
             candidates.extend(_extract_embed_codes(message))
@@ -2050,6 +2385,7 @@ async def periodic_validation_loop_body(cog):
                 SELECT giftcode, validation_status
                 FROM gift_codes
                 WHERE validation_status IN ('pending', 'validated')
+                ORDER BY validation_status = 'pending' DESC, date DESC
             """)
             codes_to_check = cog.cursor.fetchall()
 
@@ -2060,7 +2396,9 @@ async def periodic_validation_loop_body(cog):
             cog.logger.info(f"GiftOps: Found {len(codes_to_check)} codes to validate periodically.")
 
             # Get test ID for validation
-            test_fid, fid_source = await cog.get_validation_fid()
+            test_fid, fid_source = await resolve_periodic_validation_fid(cog)
+            if test_fid is None:
+                return
             cog.logger.info(f"GiftOps: Using {fid_source} ID {test_fid} for periodic validation.")
 
             codes_checked = 0
@@ -2311,6 +2649,7 @@ async def use_giftcode_for_alliance(cog, alliance_id, giftcode, process=None):
         batch_size = 10
         # Collected so the alliance gets one summary message, not one per member.
         removals = []
+        api_checks = []
 
         # Check Cache & Populate Initial List
         member_ids = [m[0] for m in members]
@@ -2325,6 +2664,9 @@ async def use_giftcode_for_alliance(cog, alliance_id, giftcode, process=None):
                 # Cached failures are retried - only conclusive successes skip.
                 active_members_to_process.append((fid, nickname, 0))
         cog.logger.info(f"GiftOps: Pre-processed {len(cached_member_statuses)} members from cache. {len(active_members_to_process)} remaining.")
+
+        from . import alliance_api_sync
+        mismatch_note = state_mismatch_note(await alliance_api_sync.api_available_async())
 
         # Progress Embed
         embed = discord.Embed(title=f"{theme.giftIcon} Gift Code Redemption: {giftcode}", color=theme.emColor1)
@@ -2352,7 +2694,7 @@ async def use_giftcode_for_alliance(cog, alliance_id, giftcode, process=None):
                         "LOGIN_EXPIRED_MID_PROCESS": f"{theme.lockIcon} **" + "{count}" + "** members login failed mid-process. How'd that even happen?",
                         "ROLE_NOT_EXIST": f"{theme.membersIcon} **" + "{count}" + "** members no longer exist in the game. Ghosts don't redeem codes. Remove them from the alliance!",
                         "NO_STATE": f"{theme.globeIcon} **" + "{count}" + "** members are off the map with no kingdom on file. Point them to their kingdom so the codes can find their way home!",
-                        "STATE_MISMATCH": f"{theme.globeIcon} **" + "{count}" + "** members are hiding out in the wrong kingdom - the game wasn't fooled. Update their kingdom and the rewards will follow.",
+                        "STATE_MISMATCH": mismatch_note,
                         "SIGN_ERROR": f"{theme.lockIcon} **" + "{count}" + "** members failed due to a signature error. Something went wrong.",
                         "ERROR": f"{theme.deniedIcon} **" + "{count}" + "** members failed due to a general error. Might want to check the logs.",
                         "UNKNOWN_API_RESPONSE": f"{theme.infoIcon} **" + "{count}" + "** members failed with an unknown API response. Say what?",
@@ -2381,7 +2723,12 @@ async def use_giftcode_for_alliance(cog, alliance_id, giftcode, process=None):
         # Cooperative preemption: yield to higher-priority work between players
         process_queue_cog = cog.bot.get_cog('ProcessQueue')
 
+        stopped_by_admin = False
         while active_members_to_process or retry_queue:
+            if process_queue_cog and process_queue_cog.stop_requested():
+                cog.logger.info(f"GiftOps: redemption of {giftcode} for {alliance_name} stopped by an admin")
+                stopped_by_admin = True
+                break
             if code_is_invalid:
                 cog.logger.info(f"GiftOps: Code {giftcode} detected as invalid, stopping redemption.")
                 break
@@ -2398,9 +2745,7 @@ async def use_giftcode_for_alliance(cog, alliance_id, giftcode, process=None):
                 if batch_results:
                     batch_process_alliance_results(cog, batch_results)
                     batch_results = []
-                if removals:
-                    await apply_removals(cog, removals)
-                    removals = []
+                await finish_removals(cog, api_checks, removals, confirm=False)
                 raise PreemptedException()
 
             current_time = time.time()
@@ -2434,7 +2779,7 @@ async def use_giftcode_for_alliance(cog, alliance_id, giftcode, process=None):
             try:
                 await asyncio.sleep(random.uniform(MEMBER_PROCESS_DELAY * 0.7, MEMBER_PROCESS_DELAY * 1.3))
                 response_status = await claim_giftcode_rewards_wos(
-                    cog, fid, giftcode, removal_collector=removals)
+                    cog, fid, giftcode, removal_collector=removals, api_checks=api_checks)
             except Exception as claim_err:
                 cog.logger.exception(f"GiftOps: Unexpected error during claim for {fid}: {claim_err}")
                 response_status = "ERROR"
@@ -2546,6 +2891,16 @@ async def use_giftcode_for_alliance(cog, alliance_id, giftcode, process=None):
                     mark_processed = True
                     fail_reason = f"API rate limited after {MAX_RETRY_CYCLES} attempts"
                     error_summary["TIMEOUT_RETRY"] = error_summary.get("TIMEOUT_RETRY", 0) + 1
+            elif response_status == "CONNECTION_ERROR":
+                if current_cycle_count + 1 < MAX_RETRY_CYCLES:
+                    queue_for_retry = True
+                    retry_delay = API_RATE_LIMIT_COOLDOWN
+                    fail_reason = "Couldn't reach the Kingshot API"
+                else:
+                    add_to_failed = True
+                    mark_processed = True
+                    fail_reason = f"Couldn't reach the Kingshot API after {MAX_RETRY_CYCLES} attempts"
+                    error_summary["CONNECTION_ERROR"] = error_summary.get("CONNECTION_ERROR", 0) + 1
             elif response_status == "TOO_POOR_SPEND_MORE":
                 add_to_failed = True
                 mark_processed = True
@@ -2561,6 +2916,11 @@ async def use_giftcode_for_alliance(cog, alliance_id, giftcode, process=None):
                 mark_processed = True
                 fail_reason = "Wrong kingdom on file"
                 error_summary["STATE_MISMATCH"] = error_summary.get("STATE_MISMATCH", 0) + 1
+            elif response_status == "NO_STATE":
+                add_to_failed = True
+                mark_processed = True
+                fail_reason = "No kingdom on file"
+                error_summary["NO_STATE"] = error_summary.get("NO_STATE", 0) + 1
             elif response_status == "DB_UNAVAILABLE":
                 add_to_failed = True
                 mark_processed = True
@@ -2605,7 +2965,8 @@ async def use_giftcode_for_alliance(cog, alliance_id, giftcode, process=None):
         # Final Embed Update
         if not code_is_invalid:
             cog.logger.info(f"GiftOps: Alliance {alliance_id} processing loop finished. Preparing final update.")
-            final_title = f"{theme.giftIcon} Gift Code Process Complete: {giftcode}"
+            final_title = (f"{theme.warnIcon} Gift Code Process Stopped by an Admin: {giftcode}"
+                           if stopped_by_admin else f"{theme.giftIcon} Gift Code Process Complete: {giftcode}")
             final_color = discord.Color.green() if failed_count == 0 and total_members > 0 else \
                           discord.Color.orange() if success_count > 0 or received_count > 0 else \
                           discord.Color.red()
@@ -2679,16 +3040,13 @@ async def use_giftcode_for_alliance(cog, alliance_id, giftcode, process=None):
             batch_process_alliance_results(cog, batch_results)
             batch_results = []
 
-        if removals:
-            await apply_removals(cog, removals)
-            removals = []
-
-        # Opt-in per-alliance summary embed after the run.
+        # Opt-in per-alliance summary embed after the run; the API step never delays it.
         await post_redemption_summary(
             cog, channel, alliance_id, alliance_name, giftcode,
             successful_users, already_used_users, failed_users_dict,
         )
 
+        await finish_removals(cog, api_checks, removals, confirm=True)
         return True
 
     except PreemptedException:
@@ -2699,7 +3057,7 @@ async def use_giftcode_for_alliance(cog, alliance_id, giftcode, process=None):
         try:
             # Apply the removals collected before the run failed.
             if locals().get('removals'):
-                await apply_removals(cog, removals)
+                await finish_removals(cog, locals().get('api_checks') or [], removals, confirm=False)
         except Exception: pass
         try:
             if 'channel' in locals() and channel: await channel.send(f"{theme.warnIcon} An unexpected error occurred processing `{giftcode}` for {alliance_name}.")

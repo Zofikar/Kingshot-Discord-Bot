@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import sqlite3
 import sys
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -149,3 +151,57 @@ def run_ocr_pipeline(image_bytes: bytes, primary_lang: str = "ch",
         "date": date,
         "rows": list(rows.values()),
     }
+
+
+def make_player_sync_dbs(tmp_path):
+    """Empty settings/alliance/users/changes databases shaped like a live install, for Player Sync tests."""
+    (tmp_path / "db").mkdir(exist_ok=True)
+    with closing(sqlite3.connect(tmp_path / "db" / "settings.sqlite")) as conn:
+        conn.execute("CREATE TABLE bot_global_settings (setting_key TEXT PRIMARY KEY, setting_value TEXT)")
+        conn.commit()
+    with closing(sqlite3.connect(tmp_path / "db" / "alliance.sqlite")) as conn:
+        conn.execute("CREATE TABLE alliancesettings (alliance_id INTEGER PRIMARY KEY, channel_id INTEGER, "
+                     "interval INTEGER, redemption_channel_id INTEGER, auto_remove_on_transfer INTEGER DEFAULT 0)")
+        conn.execute("CREATE TABLE alliance_list (alliance_id INTEGER PRIMARY KEY, name TEXT, kid INTEGER, "
+                     "multistate INTEGER DEFAULT 0, state_locked INTEGER DEFAULT 0)")
+        conn.commit()
+    with closing(sqlite3.connect(tmp_path / "db" / "users.sqlite")) as conn:
+        conn.execute("""CREATE TABLE users (
+            fid INTEGER PRIMARY KEY, nickname TEXT, furnace_lv INTEGER DEFAULT 0, kid INTEGER,
+            stove_lv_content TEXT, alliance TEXT, power INTEGER, power_updated_at TEXT,
+            combat_power INTEGER, combat_power_updated_at TEXT, state_mismatch_at TEXT,
+            kingdom_scan_next INTEGER, kingdom_scan_done_at TEXT,
+            avatar_url TEXT, api_synced_at TEXT)""")
+        conn.commit()
+    with closing(sqlite3.connect(tmp_path / "db" / "changes.sqlite")) as conn:
+        conn.execute("CREATE TABLE nickname_changes (fid, old_nickname, new_nickname, change_date)")
+        conn.execute("CREATE TABLE furnace_changes (fid, old_furnace_lv, new_furnace_lv, change_date)")
+        conn.commit()
+
+
+def fake_player_api(monkeypatch, values, available=True):
+    """Stands in for Player Sync at its lookup boundary. `values` is one answer for every ID or a
+    function of the ID; the returned state's `values`/`available` can change mid-test, `asked` lists lookups."""
+    from types import SimpleNamespace
+    from cogs import alliance_api_sync
+    state = SimpleNamespace(values=values, available=available, asked=[])
+
+    async def available_async():
+        return state.available
+
+    async def lookup(bot, fid):
+        if not state.available:
+            return alliance_api_sync.Lookup(reason=alliance_api_sync.NOT_SET_UP)
+        state.asked.append(fid)
+        found = state.values(fid) if callable(state.values) else state.values
+        return alliance_api_sync.Lookup(dict(found) if found is not None else None)
+    monkeypatch.setattr(alliance_api_sync, "api_available", lambda profile=None: state.available)
+    monkeypatch.setattr(alliance_api_sync, "api_available_async", available_async)
+    monkeypatch.setattr(alliance_api_sync, "lookup_via_bot", lookup)
+    return state
+
+
+def kid_and_flag(fid):
+    """(kid, state_mismatch_at) for a member in db/users.sqlite, or None when they're gone."""
+    with closing(sqlite3.connect("db/users.sqlite")) as conn:
+        return conn.execute("SELECT kid, state_mismatch_at FROM users WHERE fid = ?", (fid,)).fetchone()

@@ -9,7 +9,7 @@ from datetime import datetime
 import re
 from .notification_event_types import get_event_icon
 from .permission_handler import PermissionManager
-from .pimp_my_bot import theme
+from .pimp_my_bot import theme, menu_timeout
 
 logger = logging.getLogger('notification')
 
@@ -199,7 +199,7 @@ class EmbedFieldModal(discord.ui.Modal):
 class EmbedDataView(discord.ui.View):
     def __init__(self, cog, notification_id, title, description, color, image_url, thumbnail_url, footer, author,
                  mention_message, event_type=None, hour=0, minute=0, next_notification=None):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.notification_id = notification_id
         self.title = title
@@ -434,7 +434,7 @@ class EmbedDataView(discord.ui.View):
 class PlainEditorView(discord.ui.View):
     def __init__(self, cog, notification_id, channel_id, hours, minutes, description, mention, repeat,
                  next_notification, timezone, notification_type):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.notification_id = notification_id
         self.channel_id = channel_id
@@ -547,6 +547,11 @@ class PlainEditorView(discord.ui.View):
                         await modal_interaction.followup.send(f"{theme.deniedIcon} An error occurred!", ephemeral=True)
 
             await interaction.response.send_modal(DescriptionModal(self))
+        else:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} The editor can't read this notification's message, so it can't be changed here.",
+                ephemeral=True
+            )
 
     @discord.ui.button(label="Channel", style=discord.ButtonStyle.primary)
     async def edit_channel(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -566,7 +571,7 @@ class PlainEditorView(discord.ui.View):
             await self.update_embed(select_interaction)
 
         channel_select.callback = channel_select_callback
-        view = discord.ui.View()
+        view = discord.ui.View(timeout=menu_timeout())
         view.add_item(channel_select)
 
         await interaction.response.send_message("Select a new channel:", view=view, ephemeral=True)
@@ -636,7 +641,7 @@ class PlainEditorView(discord.ui.View):
     async def edit_repeat(self, interaction: discord.Interaction, button: discord.ui.Button):
         class RepeatOptionsView(discord.ui.View):
             def __init__(self, parent_view):
-                super().__init__(timeout=None)
+                super().__init__(timeout=menu_timeout())
                 self.parent_view = parent_view
 
                 custom_button = discord.ui.Button(label="Custom Intervals", style=discord.ButtonStyle.secondary)
@@ -653,7 +658,7 @@ class PlainEditorView(discord.ui.View):
 
                 class DaysView(discord.ui.View):
                     def __init__(self):
-                        super().__init__(timeout=None)
+                        super().__init__(timeout=menu_timeout())
                         self.parent_view = parent_view
                         self.selected_days = []
 
@@ -762,7 +767,7 @@ class PlainEditorView(discord.ui.View):
 
     @discord.ui.button(label="Mention", style=discord.ButtonStyle.primary)
     async def edit_mention(self, interaction: discord.Interaction, button: discord.ui.Button):
-        view = discord.ui.View()
+        view = discord.ui.View(timeout=menu_timeout())
 
         async def mention_callback(mention_interaction: discord.Interaction, mention_type: str):
             await mention_interaction.response.defer()
@@ -786,7 +791,7 @@ class PlainEditorView(discord.ui.View):
                     await self.update_embed(select_interaction)
 
                 role_select.callback = role_select_callback
-                role_view = discord.ui.View()
+                role_view = discord.ui.View(timeout=menu_timeout())
                 role_view.add_item(role_select)
 
                 await mention_interaction.followup.send("Select a role:", view=role_view, ephemeral=True)
@@ -807,7 +812,7 @@ class PlainEditorView(discord.ui.View):
                     await self.update_embed(select_interaction)
 
                 user_select.callback = user_select_callback
-                user_view = discord.ui.View()
+                user_view = discord.ui.View(timeout=menu_timeout())
                 user_view.add_item(user_select)
 
                 await mention_interaction.followup.send("Select a user:", view=user_view, ephemeral=True)
@@ -833,7 +838,7 @@ class PlainEditorView(discord.ui.View):
     @discord.ui.button(label="Notification Ping", style=discord.ButtonStyle.primary)
     async def edit_notification_ping(self, interaction: discord.Interaction, button: discord.ui.Button):
         """Show options for setting when the ping is sent."""
-        view = discord.ui.View()
+        view = discord.ui.View(timeout=menu_timeout())
 
         options = [
             ("30m, 10m, 5m & Time", 1),
@@ -1026,7 +1031,7 @@ class NotificationEditor(commands.Cog):
             else:
                 logger.warning(f"No known format matched, description is {description}")
                 await interaction.response.send_message(
-                    f"{theme.deniedIcon} Could not parse this notification's format.",
+                    f"{theme.deniedIcon} The editor can't read this notification's message, so it can't be changed here.",
                     ephemeral=True
                 )
                 return
@@ -1051,9 +1056,9 @@ class NotificationEditor(commands.Cog):
             # Refresh the last-known channel name so quarantine DMs name the right channel.
             channel_name = getattr(self.bot.get_channel(view.channel_id), "name", None)
             cursor.execute(
-                "UPDATE bear_notifications SET channel_id = ?, channel_name = ?, hour = ?, minute = ?, description = ?, mention_type = ?, repeat_minutes = ?, next_notification = ?, notification_type = ? WHERE id = ?",
-                (view.channel_id, channel_name, view.hours, view.minutes, view.description, view.mention, view.repeat,
-                 view.next_notification, view.notification_type, view.notification_id)
+                "UPDATE bear_notifications SET channel_id = ?, channel_name = ?, hour = ?, minute = ?, description = ?, mention_type = ?, repeat_enabled = ?, repeat_minutes = ?, next_notification = ?, notification_type = ? WHERE id = ?",
+                (view.channel_id, channel_name, view.hours, view.minutes, view.description, view.mention,
+                 1 if view.repeat else 0, view.repeat, view.next_notification, view.notification_type, view.notification_id)
             )
             conn.commit()
 

@@ -10,21 +10,30 @@ from discord.ext import commands
 import sqlite3
 from discord.ext import tasks
 import asyncio
-import re
 import os
 import traceback
 import logging
-from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from .gift_operationsapi import GiftCodeAPI
 from .pimp_my_bot import theme, safe_edit_message
+from . import alliance_api_sync
 from . import gift_redemption
 from . import gift_state_resolver
+from . import onnx_lifecycle
 from . import alliance_member_states
 from . import process_queue
 from . import gift_channels
 from . import gift_settings
 from .gift_views import GiftView
+
+# raise_on_status=False: the final 5xx comes back as a response so callers can retry it later.
+API_RETRY = Retry(
+    total=3,
+    backoff_factor=0.3,
+    status_forcelist=[500, 502, 503, 504],
+    allowed_methods=["POST", "GET"],
+    raise_on_status=False,
+)
 
 
 class GiftOperations(commands.Cog):
@@ -104,23 +113,15 @@ class GiftOperations(commands.Cog):
             pass
 
         # Kingshot API URLs and Key
-        self.wos_player_info_url = "https://kingshot-giftcode.centurygame.com/api/player"
         self.wos_giftcode_url = "https://kingshot-giftcode.centurygame.com/api/gift_code"
         self.wos_giftcode_redemption_url = "https://kingshot-giftcode.centurygame.com"
         self.wos_encrypt_key = "mN4!pQs6JrYwV9"
 
         # Retry Configuration for Requests
-        self.retry_config = Retry(
-            total=3,
-            backoff_factor=0.3,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["POST", "GET"]
-        )
+        self.retry_config = API_RETRY
 
         # Initialization of Locks and Cooldowns
         self._validation_lock = asyncio.Lock()
-        self.last_validation_attempt_time = 0
-        self.validation_cooldown = 5
         self._last_cleanup_date = None
         self._state_nudge_sent = False  # one-time boot nudge about member kingdoms
 
@@ -134,27 +135,9 @@ class GiftOperations(commands.Cog):
             "total_fids_processed": 0,
             "total_processing_time": 0.0
         }
-        # Test ID Settings Table
         try:
-            self.settings_cursor.execute("""
-                CREATE TABLE IF NOT EXISTS test_fid_settings (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    test_fid TEXT NOT NULL
-                )
-            """)
-            cols = [r[1] for r in self.settings_cursor.execute("PRAGMA table_info(test_fid_settings)")]
-            if "kid" not in cols:
-                self.settings_cursor.execute("ALTER TABLE test_fid_settings ADD COLUMN kid INTEGER")
-                self.settings_cursor.execute(
-                    "UPDATE test_fid_settings SET kid = 259 WHERE test_fid = '43180889'")
-            self.settings_cursor.execute("SELECT test_fid FROM test_fid_settings ORDER BY id DESC LIMIT 1")
-            result = self.settings_cursor.fetchone()
-            if not result:
-                self.settings_cursor.execute(
-                    "INSERT INTO test_fid_settings (test_fid, kid) VALUES (?, ?)", ("43180889", 259))
-                self.settings_conn.commit()
-                self.logger.info("Initialized default test ID (43180889) in database")
-            self.settings_conn.commit()
+            if gift_settings.ensure_test_fid_settings(self.settings_conn):
+                self.logger.info(f"Initialized default test ID ({gift_settings.DEFAULT_TEST_FID}) in database")
         except Exception as e:
             self.logger.exception(f"Error setting up test ID table: {e}")
 
@@ -183,6 +166,8 @@ class GiftOperations(commands.Cog):
                 print(f"Error shutting down GiftCodeAPI client: {e}")
         if hasattr(self, 'periodic_validation_loop') and self.periodic_validation_loop.is_running():
             self.periodic_validation_loop.cancel()
+        if hasattr(self, 'auto_kingdom_scan_loop') and self.auto_kingdom_scan_loop.is_running():
+            self.auto_kingdom_scan_loop.cancel()
         for task in list(getattr(self, '_revalidation_tasks', {}).values()):
             if not task.done():
                 task.cancel()
@@ -200,65 +185,90 @@ class GiftOperations(commands.Cog):
 
     # ── Event listeners ─────────────────────────────────────────────────
 
+    def register_queue_handlers(self, process_queue_cog):
+        process_queue_cog.register_handler(
+            'gift_validate',
+            lambda process: gift_redemption.handle_gift_validate_process(self, process)
+        )
+        process_queue_cog.register_handler(
+            'gift_redeem',
+            lambda process: gift_redemption.handle_gift_redeem_process(self, process)
+        )
+        process_queue_cog.register_handler(
+            'gift_redeem_member',
+            lambda process: gift_redemption.handle_member_redeem_process(self, process)
+        )
+        process_queue_cog.register_handler(
+            'state_resolve',
+            lambda process: gift_redemption.handle_state_resolve_process(self, process)
+        )
+        self.logger.info(
+            "GiftOps: Registered gift_validate, gift_redeem, gift_redeem_member "
+            "and state_resolve handlers with ProcessQueue")
+
+    def _start_background_work(self):
+        if not self.periodic_validation_loop.is_running():
+            self.periodic_validation_loop.start()
+        if not self.auto_kingdom_scan_loop.is_running():
+            self.auto_kingdom_scan_loop.start()
+        process_queue_cog = self.bot.get_cog('ProcessQueue')
+        if process_queue_cog:
+            self.register_queue_handlers(process_queue_cog)
+        else:
+            self.logger.error("GiftOps: ProcessQueue cog not found, gift code operations will not work")
+
+    async def cog_load(self):
+        # A reload never re-fires on_ready, so restart loops and handlers here when already connected.
+        if self.bot.is_ready():
+            self._start_background_work()
+
+    async def _channel_is_gone(self, channel_id) -> bool:
+        # Only a NotFound proves deletion; an outage or lost access must not wipe the config.
+        try:
+            await self.bot.fetch_channel(channel_id)
+        except discord.NotFound:
+            return True
+        except discord.HTTPException as e:
+            self.logger.warning(f"Gift code channel {channel_id} not reachable ({e}); keeping its config.")
+        return False
+
+    async def _prune_deleted_gift_channels(self):
+        self.logger.info("Validating gift code channels...")
+        self.cursor.execute("SELECT channel_id, alliance_id FROM giftcode_channel")
+        channel_configs = self.cursor.fetchall()
+
+        invalid_channels = []
+        for channel_id, alliance_id in channel_configs:
+            channel = self.bot.get_channel(channel_id)
+            if not channel:
+                if await self._channel_is_gone(channel_id):
+                    invalid_channels.append(channel_id)
+            elif not isinstance(channel, discord.TextChannel):
+                invalid_channels.append(channel_id)
+            elif not channel.permissions_for(channel.guild.me).send_messages:
+                self.logger.warning(f"Missing send message permissions in channel {channel_id}.")
+
+        if invalid_channels:
+            unique_invalid = list(set(invalid_channels))
+            placeholders = ','.join('?' * len(unique_invalid))
+            try:
+                self.cursor.execute(f"DELETE FROM giftcode_channel WHERE channel_id IN ({placeholders})", unique_invalid)
+                self.conn.commit()
+            except sqlite3.Error as db_err:
+                self.logger.exception(f"DATABASE ERROR removing invalid channels: {db_err}")
+
     @commands.Cog.listener()
     async def on_ready(self):
         self.logger.info("GiftOps Cog: on_ready triggered.")
         try:
-            self.logger.info("Validating gift code channels...")
-            self.cursor.execute("SELECT channel_id, alliance_id FROM giftcode_channel")
-            channel_configs = self.cursor.fetchall()
-
-            invalid_channels = []
-            for channel_id, alliance_id in channel_configs:
-                channel = self.bot.get_channel(channel_id)
-                if not channel:
-                    invalid_channels.append(channel_id)
-                elif not isinstance(channel, discord.TextChannel):
-                    invalid_channels.append(channel_id)
-                elif not channel.permissions_for(channel.guild.me).send_messages:
-                    self.logger.warning(f"Missing send message permissions in channel {channel_id}.")
-
-            if invalid_channels:
-                unique_invalid = list(set(invalid_channels))
-                placeholders = ','.join('?' * len(unique_invalid))
-                try:
-                    self.cursor.execute(f"DELETE FROM giftcode_channel WHERE channel_id IN ({placeholders})", unique_invalid)
-                    self.conn.commit()
-                except sqlite3.Error as db_err:
-                    self.logger.exception(f"DATABASE ERROR removing invalid channels: {db_err}")
-
-            if not self.periodic_validation_loop.is_running():
-                self.periodic_validation_loop.start()
+            self._start_background_work()
 
             # One-time nudge to global admins if member kingdoms need attention.
             if not self._state_nudge_sent:
                 self._state_nudge_sent = True
                 asyncio.create_task(self._notify_state_migration())
 
-            # Register handlers with the ProcessQueue cog
-            process_queue_cog = self.bot.get_cog('ProcessQueue')
-            if process_queue_cog:
-                process_queue_cog.register_handler(
-                    'gift_validate',
-                    lambda process: gift_redemption.handle_gift_validate_process(self, process)
-                )
-                process_queue_cog.register_handler(
-                    'gift_redeem',
-                    lambda process: gift_redemption.handle_gift_redeem_process(self, process)
-                )
-                process_queue_cog.register_handler(
-                    'gift_redeem_member',
-                    lambda process: gift_redemption.handle_member_redeem_process(self, process)
-                )
-                process_queue_cog.register_handler(
-                    'state_resolve',
-                    lambda process: gift_redemption.handle_state_resolve_process(self, process)
-                )
-                self.logger.info(
-                    "GiftOps: Registered gift_validate, gift_redeem, gift_redeem_member "
-                    "and state_resolve handlers with ProcessQueue")
-            else:
-                self.logger.error("GiftOps: ProcessQueue cog not found, gift code operations will not work")
+            await self._prune_deleted_gift_channels()
 
             self.logger.info("GiftOps Cog: on_ready setup finished successfully.")
 
@@ -280,16 +290,7 @@ class GiftOperations(commands.Cog):
             if not channel_info:
                 return
 
-            content = message.content.strip()
-            candidates = []
-            if content:
-                if len(content.split()) == 1:
-                    if re.match(r'^[a-zA-Z0-9]+$', content):
-                        candidates.append(content)
-                else:
-                    code_match = re.search(r'Code:\s*(\S+)', content, re.IGNORECASE)
-                    if code_match:
-                        candidates.append(code_match.group(1))
+            candidates = gift_redemption._extract_content_codes(message.content)
             candidates.extend(gift_redemption._extract_embed_codes(message))
 
             seen = set()
@@ -318,6 +319,18 @@ class GiftOperations(commands.Cog):
     @periodic_validation_loop.before_loop
     async def before_periodic_validation_loop(self):
         await gift_redemption.before_periodic_validation_loop_body(self)
+
+    @tasks.loop(minutes=5)
+    async def auto_kingdom_scan_loop(self):
+        try:
+            self.auto_kingdom_scan_tick()  # on the loop: ProcessQueue's cursor isn't thread-safe
+        except Exception as e:
+            self.logger.error(f"GiftOps: auto kingdom scan check failed: {e}")
+            print(f"GiftOps: auto kingdom scan check failed: {e}")
+
+    @auto_kingdom_scan_loop.before_loop
+    async def before_auto_kingdom_scan_loop(self):
+        await self.bot.wait_until_ready()
 
     # ── Menu entry point ──────────────────────────────────────────────
 
@@ -376,9 +389,6 @@ class GiftOperations(commands.Cog):
     def batch_process_alliance_results(self, results_batch):
         return gift_redemption.batch_process_alliance_results(self, results_batch)
 
-    async def get_stove_info_wos(self, player_id):
-        return await gift_redemption.get_stove_info_wos(self, player_id)
-
     async def claim_giftcode_rewards_wos(self, player_id, giftcode, *, skip_cache: bool = False):
         return await gift_redemption.claim_giftcode_rewards_wos(self, player_id, giftcode, skip_cache=skip_cache)
 
@@ -402,40 +412,55 @@ class GiftOperations(commands.Cog):
                 self.logger.warning(f"GiftOps: could not queue catch-up for FID {fid}: {e}")
         return len(fids), caught
 
-    def queue_state_resolve(self, scope):
-        """Queue the API state probe for 'mismatch' or 'missing' members. Returns the
-        number of members queued, or None if that scope is already queued/running.
+    def queue_kingdom_scan(self, mode):
+        """Queue the kingdom scan ('now' or 'auto'). Returns members queued, 0 when nobody
+        needs one, or None when a scan is already queued or running.
 
-        Never run this inline - a single member can take 25+ minutes. On the queue it
-        sits below every other job and yields between probes, so an incoming gift code
-        always redeems first."""
+        Never run this inline - a single member can take hours. On the queue it sits below
+        every other job and yields between probes, so an incoming gift code always redeems first."""
         process_queue_cog = self.bot.get_cog('ProcessQueue')
         if not process_queue_cog:
-            self.logger.error("GiftOps: ProcessQueue cog not found; cannot queue state resolution")
+            self.logger.error("GiftOps: ProcessQueue cog not found; cannot queue a kingdom scan")
             return None
-        if self.state_resolve_status(scope) is not None:
+        existing = self.kingdom_scan_status()
+        if existing is not None and (mode == 'auto' or existing['mode'] == 'now'):
             return None
-        targets = gift_redemption._state_resolve_targets(scope)
+        targets = gift_state_resolver.scan_targets(auto=(mode == 'auto'))
         if not targets:
             return 0
+        # One step above auto, so an admin's scan preempts a slow auto-scan instead of waiting days.
+        priority = process_queue.STATE_RESOLVE - 1 if mode == 'now' else process_queue.STATE_RESOLVE
         process_queue_cog.enqueue(
-            'state_resolve', process_queue.STATE_RESOLVE,
-            details={'scope': scope, 'remaining': targets, 'total': len(targets),
+            'state_resolve', priority,
+            details={'mode': mode, 'remaining': targets, 'total': len(targets),
                      'resolved': 0, 'unresolved': 0},
         )
-        self.logger.info(f"GiftOps: queued state resolution ({scope}) for {len(targets)} member(s)")
+        self.logger.info(f"GiftOps: queued kingdom scan ({mode}) for {len(targets)} member(s)")
         return len(targets)
 
-    def state_resolve_status(self, scope):
-        """Live progress for a queued or running scope, or None when it isn't queued."""
+    def kingdom_scan_status(self):
+        """The queued or running scan's progress, or None when no scan is queued."""
         process_queue_cog = self.bot.get_cog('ProcessQueue')
         if not process_queue_cog:
             return None
-        for existing in process_queue_cog.get_queued_processes_by_action(
+        for job in process_queue_cog.get_queued_processes_by_action(
                 'state_resolve', statuses=('queued', 'active')):
-            if existing['details'].get('scope') == scope:
-                return {**existing['details'], 'status': existing['status']}
+            return {**job['details'], 'mode': job['details'].get('mode', 'now'), 'status': job['status']}
         return None
+
+    def auto_kingdom_scan_tick(self):
+        """Queue an auto-scan when it's switched on and the bot has nothing else to do."""
+        if not gift_state_resolver.scan_enabled():
+            return False
+        process_queue_cog = self.bot.get_cog('ProcessQueue')
+        if not process_queue_cog:
+            return False
+        counts = process_queue_cog.queue_counts()
+        if counts['queued'] or counts['active'] or onnx_lifecycle.any_model_in_use():
+            return False
+        if alliance_api_sync.budget_spent():
+            return False
+        return bool(self.queue_kingdom_scan('auto'))
 
     def member_catchup_status(self):
         """Pending code catch-ups: {'members': n, 'codes': n, 'done': n} or None when idle."""
@@ -469,8 +494,9 @@ class GiftOperations(commands.Cog):
                     f"{theme.membersIcon} **Members missing a kingdom:** `{len(missing)}`\n"
                     f"{theme.allianceIcon} **Unbound alliances:** `{len(unbound)}` ({bindable} auto-bindable)\n"
                     f"{theme.lowerDivider}\n\n"
-                    "Open **Alliance Management -> Member Kingdoms** and run Auto-bind, "
-                    "Assign, then Resolve. Members that already have a correct kingdom redeem fine."
+                    "Open **Alliance Management -> Member Kingdoms**: give alliances their kingdom "
+                    "under **Alliance Kingdoms**, then fix members under **Members to Fix**. "
+                    "Members that already have a correct kingdom redeem fine."
                 ),
                 color=theme.emColor2,
             )
@@ -526,9 +552,6 @@ class GiftOperations(commands.Cog):
         return await gift_channels.channel_history_scan(self, interaction)
 
     # ── Delegation to gift_settings ───────────────────────────────────
-
-    async def verify_test_fid(self, fid):
-        return await gift_settings.verify_test_fid(self, fid)
 
     async def update_test_fid(self, new_fid, kid=None):
         return await gift_settings.update_test_fid(self, new_fid, kid)

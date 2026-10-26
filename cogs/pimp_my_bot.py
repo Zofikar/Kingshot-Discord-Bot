@@ -14,6 +14,8 @@ import unicodedata
 import aiohttp
 import logging
 from typing import Tuple
+from contextlib import closing, contextmanager
+from contextvars import ContextVar
 
 logger = logging.getLogger('bot')
 from .permission_handler import PermissionManager
@@ -183,6 +185,14 @@ async def safe_edit_message(interaction: discord.Interaction, embed: discord.Emb
         await interaction.edit_original_response(embed=embed, view=view, content=content, **extra)
 
 
+def plural(count, word) -> str:
+    return word if count == 1 else f"{word}s"
+
+
+def count_text(count, word) -> str:
+    return f"{count} {plural(count, word)}"
+
+
 def expired_embed(what: str = "menu") -> discord.Embed:
     """Standard 'this menu timed out' notice. Keep wording consistent bot-wide."""
     return discord.Embed(
@@ -198,11 +208,8 @@ def expired_embed(what: str = "menu") -> discord.Embed:
 
 
 async def notify_view_expired(view: discord.ui.View, what: str = "menu"):
-    """Call from a View.on_timeout to replace a finite-timeout menu with the
-    standard expiry notice. No-op if the view never stored `self.message`.
-    Set `self.message = await interaction.original_response()` when first sending
-    the menu, and `self.stop()` on normal finalize so a stale timeout can't
-    overwrite a completed action."""
+    """Call from a confirmation dialog's on_timeout so a stale Confirm can't be clicked.
+    Menus don't use this: they stay clickable and a late click reopens the main menu."""
     msg = getattr(view, "message", None)
     if msg is None:
         return
@@ -212,20 +219,180 @@ async def notify_view_expired(view: discord.ui.View, what: str = "menu"):
         pass
 
 
-async def disable_expired_view(view: discord.ui.View):
-    """For DATA displays (lists, rankings, charts, reports): on timeout, grey out
-    the controls but KEEP the content visible — never wipe a display to an expiry
-    notice. Use this instead of notify_view_expired for anything the user is
-    reading. No-op if the view never stored `self.message`."""
-    msg = getattr(view, "message", None)
-    if msg is None:
-        return
-    for child in view.children:
-        child.disabled = True
+MENU_TIMEOUT_DEFAULT_MINUTES = 120
+MENU_TIMEOUT_MAX_MINUTES = 1440
+CONFIRM_TIMEOUT_DEFAULT_SECONDS = 60
+CONFIRM_TIMEOUT_MAX_SECONDS = 3600
+_timeout_cache = {}  # setting key -> value; the setters keep it current
+
+
+def _timeout_setting(key: str, default: int) -> int:
+    if key not in _timeout_cache:
+        try:
+            with closing(sqlite3.connect('db/settings.sqlite', timeout=30.0)) as conn:
+                row = conn.execute("SELECT setting_value FROM bot_global_settings WHERE setting_key = ?",
+                                   (key,)).fetchone()
+            _timeout_cache[key] = int(row[0]) if row else default
+        except (sqlite3.Error, ValueError):
+            return default  # not cached, so a later read can still succeed
+    return _timeout_cache[key]
+
+
+def _save_timeout_setting(key: str, value: int, maximum: int, unit: str) -> None:
+    if not 0 <= value <= maximum:
+        raise ValueError(f"must be 0-{maximum} {unit}")
+    with closing(sqlite3.connect('db/settings.sqlite', timeout=30.0)) as conn:
+        conn.execute("INSERT OR REPLACE INTO bot_global_settings (setting_key, setting_value) "
+                     "VALUES (?, ?)", (key, str(value)))
+        conn.commit()
+    _timeout_cache[key] = value
+
+
+def get_menu_timeout_minutes() -> int:
+    """Bot-wide menu timeout in minutes (0 = never), from Bot Health -> Settings."""
+    return _timeout_setting('menu_timeout_minutes', MENU_TIMEOUT_DEFAULT_MINUTES)
+
+
+def set_menu_timeout_minutes(minutes: int) -> None:
+    _save_timeout_setting('menu_timeout_minutes', minutes, MENU_TIMEOUT_MAX_MINUTES, "minutes")
+
+
+def get_confirm_timeout_seconds() -> int:
+    """Bot-wide timeout for confirmation dialogs in seconds (0 = never), from Bot Health -> Settings."""
+    return _timeout_setting('confirm_timeout_seconds', CONFIRM_TIMEOUT_DEFAULT_SECONDS)
+
+
+def set_confirm_timeout_seconds(seconds: int) -> None:
+    _save_timeout_setting('confirm_timeout_seconds', seconds, CONFIRM_TIMEOUT_MAX_SECONDS, "seconds")
+
+
+def menu_timeout():
+    """View timeout for menus: seconds, or None when menus never time out. Menus opened
+    after a change pick it up; open ones keep theirs."""
+    minutes = get_menu_timeout_minutes()
+    return None if minutes == 0 else minutes * 60.0
+
+
+def confirm_timeout():
+    """View timeout for confirmation dialogs: seconds, or None when they never time out."""
+    seconds = get_confirm_timeout_seconds()
+    return None if seconds == 0 else float(seconds)
+
+
+def resolve_emoji_input(content: str) -> str | None:
+    # Image URL or unicode emoji to store for an icon, None when unusable
+    content = content.strip()
+    emoji_match = re.search(r'<(a)?:\w+:(\d+)>', content)
+    if emoji_match:
+        emoji_ext = "gif" if emoji_match.group(1) else "png"
+        return f"https://cdn.discordapp.com/emojis/{emoji_match.group(2)}.{emoji_ext}"
+    if content.startswith('http') and any(ext in content.lower() for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
+        return content
+    if content and len(content) <= 10:
+        for char in content:
+            try:
+                if unicodedata.category(char) in ['So', 'Sm'] or ord(char) > 0x1F000:
+                    return content
+            except (ValueError, TypeError):
+                pass
+    return None
+
+
+def cap_theme_options(theme_rows, pinned_names):
+    # Discord selects hold at most 25 options; keep the pinned themes when trimming
+    if len(theme_rows) <= 25:
+        return theme_rows
+    return sorted(theme_rows, key=lambda row: row[0] not in pinned_names)[:25]
+
+
+async def report_failed_click(interaction: discord.Interaction, where: str, error: Exception,
+                              text: str = "That didn't work. The error was written to the bot log."):
+    """Log a click that failed and tell the clicker privately, so it never goes unanswered."""
+    logger.error(f"Error in {where}: {error}")
+    print(f"Error in {where}: {error}")
     try:
-        await msg.edit(view=view)
+        if interaction.response.is_done():
+            await interaction.followup.send(f"{theme.deniedIcon} {text}", ephemeral=True)
+        else:
+            await interaction.response.send_message(f"{theme.deniedIcon} {text}", ephemeral=True)
     except discord.HTTPException:
         pass
+
+
+class MenuView(discord.ui.View):
+    """Base for menus: the menu timeout setting, opener-only clicks when an opener is
+    given, and a private reply instead of 'This interaction failed' when a button breaks."""
+
+    def __init__(self, owner_id: int | None = None):
+        super().__init__(timeout=menu_timeout())
+        self.original_user_id = owner_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return self.original_user_id is None or await check_interaction_user(interaction, self.original_user_id)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await report_failed_click(interaction, type(self).__name__, error)
+
+
+async def require_global_admin(interaction: discord.Interaction, denial_text: str) -> bool:
+    """True for a Global admin; anyone else gets `denial_text` privately."""
+    _, is_global = PermissionManager.is_admin(interaction.user.id)
+    if not is_global:
+        await interaction.response.send_message(f"{theme.deniedIcon} {denial_text}", ephemeral=True)
+    return is_global
+
+
+class GlobalAdminView(MenuView):
+    """Menu with code-built buttons; every click re-checks Global admin, since rights can change while it's open."""
+    denial_text = ""
+
+    def __init__(self, cog, owner_id: int):
+        super().__init__(owner_id)
+        self.cog = cog
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await require_global_admin(interaction, self.denial_text) and await super().interaction_check(interaction)
+
+    def _add_button(self, label, emoji, style, row, callback, disabled=False):
+        button = discord.ui.Button(label=label, emoji=f"{emoji}", style=style, row=row, disabled=disabled)
+        button.callback = callback
+        self.add_item(button)
+
+
+class ConfirmView(discord.ui.View):
+    """Base for confirmation dialogs: the confirm timeout setting, then the expired notice.
+    Set `self.message` when sending, and call `self.stop()` once it's answered."""
+
+    def __init__(self, what: str = "confirmation"):
+        super().__init__(timeout=confirm_timeout())
+        self.message = None
+        self._what = what
+
+    async def on_timeout(self):
+        await notify_view_expired(self, self._what)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await report_failed_click(interaction, type(self).__name__, error)
+
+
+def has_live_handler(view_store, interaction) -> bool:
+    """True when a live view or dynamic item answers this component click (mirrors
+    discord.py's ViewStore.dispatch_view). Unknown internals count as live, so a
+    discord.py change can never make us hijack a working menu."""
+    try:
+        views, dynamic = view_store._views, view_store._dynamic_items
+        key = (interaction.data["component_type"], interaction.data["custom_id"])
+        message = interaction.message
+        entities = [None]
+        if message is not None:
+            entities.append(message.id)
+            if getattr(message, "interaction_metadata", None) is not None:
+                entities.append(message.interaction_metadata.id)
+        if any(key in views.get(entity, {}) for entity in entities):
+            return True
+        return any(pattern.fullmatch(key[1]) for pattern in dynamic)
+    except Exception:
+        return True
 
 
 def build_divider(start, pattern, end, length, max_length=99):
@@ -263,75 +430,16 @@ def build_divider(start, pattern, end, length, max_length=99):
 
     return start_str + middle + end_str
 
-class ThemeManager:
-    """
-    Singleton class that manages theme configuration.
-    Loads theme values from database and provides them as attributes.
-    """
-    _instance = None
+class ThemeValues:
+    """Resolved icons, colors and dividers of one theme."""
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-            cls._instance._initialized = False
-        return cls._instance
-
-    def __init__(self):
-        if self._initialized:
-            return
-        self._initialized = True
-        self._bot = None
+    def __init__(self, theme_dict: dict | None = None, accessible_emoji_ids: set | None = None):
         self._set_defaults()
-        self.load()
+        if theme_dict:
+            self._apply_theme(theme_dict)
+        if accessible_emoji_ids is not None:
+            self._hide_inaccessible_emojis(accessible_emoji_ids)
 
-    async def set_bot(self, bot):
-        """Set bot reference for emoji validation. Call this after bot is ready."""
-        self._bot = bot
-        # Fetch application emojis and validate
-        app_emojis = await self._fetch_application_emojis()
-        self._validate_emojis(app_emojis)
-
-    async def _fetch_application_emojis(self):
-        """Fetch list of application emoji IDs the bot has access to."""
-        if not self._bot:
-            return set()
-
-        try:
-            # Use discord.py's built-in method
-            app_emojis = await self._bot.fetch_application_emojis()
-            return {e.id for e in app_emojis}
-        except Exception as e:
-            logger.warning(f"Could not fetch application emojis: {e}")
-            print(f"Could not fetch application emojis: {e}")
-            return set()
-
-    def _validate_emojis(self, accessible_emoji_ids: set = None):
-        """Check all icon attributes and hide inaccessible custom emojis."""
-        if not self._bot:
-            return
-
-        # Build set of accessible emoji IDs (guild emojis + application emojis)
-        if accessible_emoji_ids is None:
-            accessible_emoji_ids = set()
-
-        # Add guild emojis the bot can see
-        for emoji in self._bot.emojis:
-            accessible_emoji_ids.add(emoji.id)
-
-        for icon_name in ICON_NAMES:
-            value = getattr(self, icon_name, None)
-            if not value:
-                continue
-
-            # Check if it's a custom Discord emoji
-            match = re.match(r'<a?:(\w+):(\d+)>', str(value))
-            if match:
-                emoji_name = match.group(1)
-                emoji_id = int(match.group(2))
-                # If bot can't access this emoji, set to empty string (hidden)
-                if emoji_id not in accessible_emoji_ids:
-                    logger.warning(f"Theme emoji '{icon_name}' (:{emoji_name}:{emoji_id}) is inaccessible - hiding it")
-                    setattr(self, icon_name, "")
 
     def _set_defaults(self):
         """Set all theme values to defaults."""
@@ -350,13 +458,135 @@ class ThemeManager:
         self.emColorString2 = "#FF0000"
         self.emColorString3 = "#00FF00"
         self.emColorString4 = "#FFFF00"
-        self.headerColor1 = "#1F77B4"
-        self.headerColor2 = "#28A745"
 
         # Divider defaults (20 chars to fit mobile with thumbnails)
         self.upperDivider = "━━━━━━━━━━━━━━━━━━━━"
         self.lowerDivider = "━━━━━━━━━━━━━━━━━━━━"
         self.middleDivider = "━━━━━━━━━━━━━━━━━━━━"
+
+    def _apply_theme(self, theme_dict):
+        """Apply theme data from database row dictionary."""
+        # Apply icons using the ICON_NAMES constant
+        for icon_name in ICON_NAMES:
+            value = theme_dict.get(icon_name) or DEFAULT_ICON_VALUES.get(icon_name) or DEFAULT_EMOJI
+            setattr(self, icon_name, value)
+
+        # Apply divider settings using the shared build_divider function
+        # Code block wrapping is configurable per divider (default: no code block)
+        divider1 = build_divider(
+            theme_dict.get('dividerStart1') or "━",
+            theme_dict.get('dividerPattern1') or "━",
+            theme_dict.get('dividerEnd1') or "━",
+            int(theme_dict.get('dividerLength1') or 20)
+        )
+        divider2 = build_divider(
+            theme_dict.get('dividerStart2') or "━",
+            theme_dict.get('dividerPattern2') or "━",
+            theme_dict.get('dividerEnd2') or "━",
+            int(theme_dict.get('dividerLength2') or 20)
+        )
+        divider3 = build_divider(
+            theme_dict.get('dividerStart3') or "━",
+            theme_dict.get('dividerPattern3') or "━",
+            theme_dict.get('dividerEnd3') or "━",
+            int(theme_dict.get('dividerLength3') or 20)
+        )
+
+        # Apply code block wrapping if enabled
+        self.upperDivider = f"`{divider1}`" if theme_dict.get('dividerCodeBlock1') else divider1
+        self.lowerDivider = f"`{divider2}`" if theme_dict.get('dividerCodeBlock2') else divider2
+        self.middleDivider = f"`{divider3}`" if theme_dict.get('dividerCodeBlock3') else divider3
+
+        # Apply colors by name
+        self.emColorString1 = theme_dict.get('emColorString1') or "#0000FF"
+        self.emColorString2 = theme_dict.get('emColorString2') or "#FF0000"
+        self.emColorString3 = theme_dict.get('emColorString3') or "#00FF00"
+        self.emColorString4 = theme_dict.get('emColorString4') or "#FFFF00"
+
+        # Convert color strings to integers (with fallback for malformed values)
+        def parse_color(color_str: str, default: int) -> int:
+            try:
+                return int(color_str.lstrip('#'), 16)
+            except ValueError:
+                return default
+
+        self.emColor1 = parse_color(self.emColorString1, 0x0000FF)
+        self.emColor2 = parse_color(self.emColorString2, 0xFF0000)
+        self.emColor3 = parse_color(self.emColorString3, 0x00FF00)
+        self.emColor4 = parse_color(self.emColorString4, 0xFFFF00)
+
+    def _hide_inaccessible_emojis(self, accessible_emoji_ids: set):
+        for icon_name in ICON_NAMES:
+            match = re.match(r'<a?:(\w+):(\d+)>', str(getattr(self, icon_name, "") or ""))
+            if match and int(match.group(2)) not in accessible_emoji_ids:
+                logger.warning(f"Theme emoji '{icon_name}' (:{match.group(1)}:{match.group(2)}) is inaccessible - hiding it")
+                setattr(self, icon_name, "")
+
+
+# Server whose theme `theme.*` resolves to; set per interaction/message by the gateway hook.
+_theme_guild: ContextVar[int | None] = ContextVar("theme_guild", default=None)
+
+
+class ThemeManager:
+    """
+    Singleton that serves theme values. Attribute reads resolve to the current
+    server's applied theme, or the bot-wide active theme.
+    """
+    _instance = None
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+
+    def __init__(self):
+        if self._initialized:
+            return
+        self._initialized = True
+        self._bot = None
+        self._app_emoji_ids = set()
+        self._global = ThemeValues()
+        self._guild_values = {}  # {guild_id: ThemeValues | None}
+        self.load()
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._current_values(), name)
+
+    def _current_values(self) -> ThemeValues:
+        guild_id = _theme_guild.get()
+        if guild_id is None:
+            return self._global
+        if guild_id not in self._guild_values:
+            self._guild_values[guild_id] = self._load_guild_values(guild_id)
+        return self._guild_values[guild_id] or self._global
+
+    async def set_bot(self, bot):
+        """Set bot reference for emoji validation. Call this after bot is ready."""
+        self._bot = bot
+        self._app_emoji_ids = await self._fetch_application_emojis()
+        self.load()
+
+    async def _fetch_application_emojis(self):
+        """Fetch list of application emoji IDs the bot has access to."""
+        if not self._bot:
+            return set()
+
+        try:
+            app_emojis = await self._bot.fetch_application_emojis()
+            return {e.id for e in app_emojis}
+        except Exception as e:
+            logger.warning(f"Could not fetch application emojis: {e}")
+            print(f"Could not fetch application emojis: {e}")
+            return set()
+
+    def _accessible_emoji_ids(self) -> set | None:
+        if not self._bot:
+            return None
+        return self._app_emoji_ids | {emoji.id for emoji in self._bot.emojis}
+
 
     def _ensure_db(self):
         """Create database and default theme if they don't exist."""
@@ -559,25 +789,22 @@ class ThemeManager:
                 logger.info("Theme database created with default theme.")
 
     def load(self):
-        """Load theme from database. Safe to call multiple times."""
-        # Ensure database exists
+        """Reload the bot-wide active theme and drop cached server themes. Safe to call multiple times."""
         self._ensure_db()
+        self._guild_values = {}
 
         if not os.path.exists(THEME_DB_PATH):
             return
 
         try:
             with sqlite3.connect(THEME_DB_PATH) as conn:
-                # Use Row factory to get dict-like access by column name
                 conn.row_factory = sqlite3.Row
                 cursor = conn.cursor()
 
-                # Check if table exists
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='pimpsettings'")
                 if not cursor.fetchone():
                     return
 
-                # Get active theme
                 cursor.execute("SELECT * FROM pimpsettings WHERE is_active=1 LIMIT 1")
                 theme_row = cursor.fetchone()
 
@@ -586,106 +813,27 @@ class ThemeManager:
                     theme_row = cursor.fetchone()
 
                 if theme_row:
-                    # Convert Row to dict for easier access
-                    theme_dict = dict(theme_row)
-                    self._apply_theme(theme_dict)
-                    self._validate_emojis()
+                    self._global = ThemeValues(dict(theme_row), self._accessible_emoji_ids())
 
         except Exception as e:
             logger.warning(f"Could not load theme settings: {e}")
             print(f"Warning: Could not load theme settings: {e}")
 
-    def _apply_theme(self, theme_dict):
-        """Apply theme data from database row dictionary."""
-        # Apply icons using the ICON_NAMES constant
-        for icon_name in ICON_NAMES:
-            value = theme_dict.get(icon_name) or DEFAULT_ICON_VALUES.get(icon_name) or DEFAULT_EMOJI
-            setattr(self, icon_name, value)
-
-        # Apply divider settings using the shared build_divider function
-        # Code block wrapping is configurable per divider (default: no code block)
-        divider1 = build_divider(
-            theme_dict.get('dividerStart1') or "━",
-            theme_dict.get('dividerPattern1') or "━",
-            theme_dict.get('dividerEnd1') or "━",
-            int(theme_dict.get('dividerLength1') or 20)
-        )
-        divider2 = build_divider(
-            theme_dict.get('dividerStart2') or "━",
-            theme_dict.get('dividerPattern2') or "━",
-            theme_dict.get('dividerEnd2') or "━",
-            int(theme_dict.get('dividerLength2') or 20)
-        )
-        divider3 = build_divider(
-            theme_dict.get('dividerStart3') or "━",
-            theme_dict.get('dividerPattern3') or "━",
-            theme_dict.get('dividerEnd3') or "━",
-            int(theme_dict.get('dividerLength3') or 20)
-        )
-
-        # Apply code block wrapping if enabled
-        self.upperDivider = f"`{divider1}`" if theme_dict.get('dividerCodeBlock1') else divider1
-        self.lowerDivider = f"`{divider2}`" if theme_dict.get('dividerCodeBlock2') else divider2
-        self.middleDivider = f"`{divider3}`" if theme_dict.get('dividerCodeBlock3') else divider3
-
-        # Apply colors by name
-        self.emColorString1 = theme_dict.get('emColorString1') or "#0000FF"
-        self.emColorString2 = theme_dict.get('emColorString2') or "#FF0000"
-        self.emColorString3 = theme_dict.get('emColorString3') or "#00FF00"
-        self.emColorString4 = theme_dict.get('emColorString4') or "#FFFF00"
-        self.headerColor1 = theme_dict.get('headerColor1') or "#1F77B4"
-        self.headerColor2 = theme_dict.get('headerColor2') or "#28A745"
-
-        # Convert color strings to integers (with fallback for malformed values)
-        def parse_color(color_str: str, default: int) -> int:
-            try:
-                return int(color_str.lstrip('#'), 16)
-            except ValueError:
-                return default
-
-        self.emColor1 = parse_color(self.emColorString1, 0x0000FF)
-        self.emColor2 = parse_color(self.emColorString2, 0xFF0000)
-        self.emColor3 = parse_color(self.emColorString3, 0x00FF00)
-        self.emColor4 = parse_color(self.emColorString4, 0xFFFF00)
-
-    def load_for_guild(self, guild_id: int = None):
-        """Load theme for specific guild, or global if no override."""
-        self._ensure_db()
-
+    def _load_guild_values(self, guild_id: int) -> ThemeValues | None:
+        """The server's applied theme, or None when it uses the bot-wide theme."""
         try:
-            with sqlite3.connect(THEME_DB_PATH) as conn:
+            with closing(sqlite3.connect(THEME_DB_PATH)) as conn:
                 conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-
-                theme_name = None
-
-                # Check for server-specific override
-                if guild_id:
-                    cursor.execute(
-                        "SELECT theme_name FROM server_themes WHERE guild_id = ?",
-                        (guild_id,)
-                    )
-                    result = cursor.fetchone()
-                    if result:
-                        theme_name = result['theme_name']
-
-                # Fall back to global active theme
-                if not theme_name:
-                    cursor.execute("SELECT themeName FROM pimpsettings WHERE is_active = 1")
-                    result = cursor.fetchone()
-                    theme_name = result['themeName'] if result else 'default'
-
-                # Load the theme
-                cursor.execute("SELECT * FROM pimpsettings WHERE themeName = ?", (theme_name,))
-                row = cursor.fetchone()
-
-                if row:
-                    self._apply_theme(dict(row))
-                    self._validate_emojis()
-
-        except Exception as e:
+                row = conn.execute(
+                    "SELECT p.* FROM server_themes s JOIN pimpsettings p ON p.themeName = s.theme_name "
+                    "WHERE s.guild_id = ? AND COALESCE(p.is_active, 0) = 0",
+                    (guild_id,)
+                ).fetchone()
+        except sqlite3.Error as e:
             logger.warning(f"Could not load theme for guild {guild_id}: {e}")
-            print(f"Warning: Could not load theme for guild {guild_id}: {e}")
+            return None
+        return ThemeValues(dict(row), self._accessible_emoji_ids()) if row else None
+
 
     def get_server_theme_name(self, guild_id: int) -> str:
         """Get the theme name for a specific server (or global if no override)."""
@@ -714,16 +862,22 @@ class ThemeManager:
 # Singleton instance - this is what other modules import
 theme = ThemeManager()
 
-def get_theme_for_guild(guild_id: int = None) -> ThemeManager:
-    """Get theme configured for a specific guild. Reloads the singleton with guild's theme."""
-    theme.load_for_guild(guild_id)
-    return theme
+
+@contextmanager
+def use_guild_theme(guild_id: int | None):
+    """Resolve `theme.*` to this server's theme inside the block (and tasks it creates)."""
+    token = _theme_guild.set(guild_id)
+    try:
+        yield
+    finally:
+        _theme_guild.reset(token)
+
 
 class ThemeMenuView(discord.ui.View):
     """Main theme management menu - entry point from settings."""
 
     def __init__(self, cog, original_user_id, guild_id: int = None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.original_user_id = original_user_id
         self.guild_id = guild_id
@@ -845,7 +999,8 @@ class ThemeMenuView(discord.ui.View):
 
         if themes:
             options = []
-            for name, is_active_flag, created_guild_id in themes:
+            pinned = {self.selected_theme, global_active, server_theme, "default"}
+            for name, is_active_flag, created_guild_id in cap_theme_options(themes, pinned):
                 # Build label with status indicators
                 label = name
                 if is_active_flag:
@@ -1058,8 +1213,7 @@ class ThemeMenuView(discord.ui.View):
                 cursor.execute("UPDATE pimpsettings SET is_active=1 WHERE themeName=?", (self.selected_theme,))
                 conn.commit()
 
-            # Reload theme - use guild theme if server has override, otherwise global
-            theme.load_for_guild(self.guild_id)
+            theme.load()
 
             # Rebuild components and embed to reflect new active state
             self._build_components()
@@ -1096,8 +1250,7 @@ class ThemeMenuView(discord.ui.View):
         try:
             self.cog.activate_theme_for_server(self.guild_id, self.selected_theme)
 
-            # Reload theme for this guild
-            theme.load_for_guild(self.guild_id)
+            theme.load()
 
             # Rebuild components and embed
             self._build_components()
@@ -1127,8 +1280,7 @@ class ThemeMenuView(discord.ui.View):
         try:
             self.cog.clear_server_theme(self.guild_id)
 
-            # Reload theme for this guild (now falls back to global since override cleared)
-            theme.load_for_guild(self.guild_id)
+            theme.load()
 
             # Rebuild components and embed
             self._build_components()
@@ -1417,7 +1569,7 @@ class DeleteThemeConfirmView(discord.ui.View):
     """Confirmation view for deleting a theme."""
 
     def __init__(self, cog, original_user_id, theme_name, menu_view):
-        super().__init__(timeout=60)
+        super().__init__(timeout=confirm_timeout())
         self.cog = cog
         self.original_user_id = original_user_id
         self.theme_name = theme_name
@@ -1491,7 +1643,7 @@ class CreateThemeModal(discord.ui.Modal):
 
 class CreateThemeView(discord.ui.View):
     def __init__(self, cog, original_user_id, guild_id: int = None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.original_user_id = original_user_id
         self.guild_id = guild_id
@@ -1513,7 +1665,7 @@ class CreateThemeView(discord.ui.View):
 
 class DeleteThemeView(discord.ui.View):
     def __init__(self, cog, original_user_id, themename=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.original_user_id = original_user_id
         self.selected_theme = themename
@@ -1521,12 +1673,12 @@ class DeleteThemeView(discord.ui.View):
         with sqlite3.connect(THEME_DB_PATH) as conn:
             cursor = conn.cursor()
             cursor.execute("SELECT themeName FROM pimpsettings WHERE themeName != 'default'")
-            theme_names = [row[0] for row in cursor.fetchall()]
+            theme_rows = cursor.fetchall()
 
-        if theme_names:
+        if theme_rows:
             select_options = [
                 discord.SelectOption(label=name, value=name, default=(name == themename))
-                for name in theme_names
+                for (name,) in cap_theme_options(theme_rows, {themename})
             ]
             delete_select = discord.ui.Select(
                 placeholder="Select a theme to delete",
@@ -1565,23 +1717,20 @@ class DeleteThemeView(discord.ui.View):
             return
 
         try:
+            can_delete, error_msg = self.cog.can_delete_theme(
+                self.selected_theme,
+                self.original_user_id,
+                interaction.guild_id
+            )
+            if not can_delete:
+                await interaction.response.send_message(
+                    f"{theme.deniedIcon} {error_msg}",
+                    ephemeral=True
+                )
+                return
+
             with sqlite3.connect(THEME_DB_PATH) as conn:
                 cursor = conn.cursor()
-
-                cursor.execute("SELECT is_active FROM pimpsettings WHERE themeName=?", (self.selected_theme,))
-                result = cursor.fetchone()
-
-                if result and result[0] == 1:
-                    await interaction.response.send_message(
-                        f"{theme.upperDivider}\n"
-                        f"### {theme.warnIcon} Warning: {theme.warnIcon}\n"
-                        "You cannot delete the active theme.\n\n"
-                        "Make sure to activate a different theme before deleting.\n\n"
-                        f"{theme.lowerDivider}\n\n",
-                        ephemeral=True
-                    )
-                    return
-
                 cursor.execute("DELETE FROM pimpsettings WHERE themeName=?", (self.selected_theme,))
                 conn.commit()
 
@@ -1680,7 +1829,7 @@ class MultiFieldEditModal(discord.ui.Modal):
                 cursor.execute("SELECT is_active FROM pimpsettings WHERE themeName=?", (self.themename,))
                 result = cursor.fetchone()
                 if result and result[0] == 1:
-                    theme.load_for_guild(None)
+                    theme.load()
 
             # Rebuild embeds
             new_icons = self.cog._get_theme_data(self.themename)
@@ -1704,7 +1853,7 @@ class MultiFieldEditModal(discord.ui.Modal):
 
 class EditEmojiChoiceView(discord.ui.View):
     def __init__(self, pagination_view, emoji_name, current_url, themename, original_user_id):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.pagination_view = pagination_view
         self.emoji_name = emoji_name
         self.current_url = current_url
@@ -1792,7 +1941,7 @@ class EditEmojiModal(discord.ui.Modal):
 
 class PaginationView(discord.ui.View):
     def __init__(self, pages, current_page, all_emoji_names, themename, cog, original_user_id, from_menu=False):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.pages = pages
         self.current_page = current_page
         self.all_emoji_names = all_emoji_names
@@ -2013,6 +2162,14 @@ class PaginationView(discord.ui.View):
         if not await check_interaction_user(interaction, self.original_user_id):
             return
 
+        _, is_global_admin = PermissionManager.is_admin(interaction.user.id)
+        if not is_global_admin:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Only global administrators can set the global theme.",
+                ephemeral=True
+            )
+            return
+
         try:
             with sqlite3.connect(THEME_DB_PATH) as conn:
                 cursor = conn.cursor()
@@ -2088,7 +2245,7 @@ class PaginationView(discord.ui.View):
             color=theme.emColor2
         )
 
-        view = discord.ui.View(timeout=7200)
+        view = discord.ui.View(timeout=menu_timeout())
 
         confirm_btn = discord.ui.Button(
             label="Delete",
@@ -2104,6 +2261,13 @@ class PaginationView(discord.ui.View):
 
         async def confirm_delete(btn_interaction: discord.Interaction):
             if not await check_interaction_user(btn_interaction, self.original_user_id):
+                return
+
+            can_delete, error_msg = self.cog.can_delete_theme(
+                self.themename, self.original_user_id, btn_interaction.guild_id
+            )
+            if not can_delete:
+                await btn_interaction.response.send_message(f"{theme.deniedIcon} {error_msg}", ephemeral=True)
                 return
 
             try:
@@ -2964,9 +3128,7 @@ class Theme(commands.Cog):
                 cursor.execute("UPDATE pimpsettings SET is_active=1 WHERE themeName=?", (themename,))
                 conn.commit()
 
-            # Reload theme - use guild theme if server has override, otherwise global
-            guild_id = interaction.guild.id if interaction.guild else None
-            theme.load_for_guild(guild_id)
+            theme.load()
 
             embed = discord.Embed(
                 title=f"{theme.verifiedIcon} Theme Activated",
@@ -3182,13 +3344,9 @@ class Theme(commands.Cog):
             view = PaginationView(pages, 0, all_emoji_names, themename, self, interaction.user.id, from_menu=from_menu)
 
             if is_new_theme:
-                await interaction.followup.send(
-                    f"{theme.verifiedIcon} **Theme '{themename}' created successfully!**\n\nHere's your new theme preview:",
-                    embeds=pages[0],
-                    view=view
-                )
-            else:
-                await interaction.followup.send(embeds=pages[0], view=view)
+                first = pages[0][0]
+                first.description = f"{theme.verifiedIcon} **Theme '{themename}' created.**\n\n{first.description or ''}"
+            await interaction.followup.send(embeds=pages[0], view=view)
 
         except Exception as e:
             logger.error(f"Fetch theme info error: {e}")
@@ -3380,9 +3538,6 @@ class Theme(commands.Cog):
         if session is None:
             return
 
-        emoji_pattern = r'<a?:(\w+):(\d+)>'
-        emoji_match = re.search(emoji_pattern, message.content)
-
         emoji_url = None
         is_valid = False
 
@@ -3397,26 +3552,9 @@ class Theme(commands.Cog):
                     is_valid = True
                     break
 
-        if not is_valid and emoji_match:
-            emoji_id = emoji_match.group(2)
-            is_animated = "<a:" in message.content
-            emoji_ext = "gif" if is_animated else "png"
-            emoji_url = f"https://cdn.discordapp.com/emojis/{emoji_id}.{emoji_ext}"
-            is_valid = True
-        elif not is_valid:
-            content = message.content.strip()
-            if content.startswith('http') and any(ext in content.lower() for ext in ['.png', '.jpg', '.jpeg', '.gif', '.webp']):
-                emoji_url = content
-                is_valid = True
-            elif content and len(content) <= 10:
-                for char in content:
-                    try:
-                        if unicodedata.category(char) in ['So', 'Sm'] or ord(char) > 0x1F000:
-                            emoji_url = content
-                            is_valid = True
-                            break
-                    except (ValueError, TypeError):
-                        pass
+        if not is_valid:
+            emoji_url = resolve_emoji_input(message.content)
+            is_valid = emoji_url is not None
 
         if not is_valid:
             return

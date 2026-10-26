@@ -8,7 +8,8 @@ import asyncio
 import sqlite3
 import logging
 from datetime import datetime
-from .pimp_my_bot import theme
+from .pimp_my_bot import theme, menu_timeout
+from .alliance_member_edit import log_avatar_url
 from .permission_handler import PermissionManager
 
 logger = logging.getLogger('bot')
@@ -16,7 +17,7 @@ logger = logging.getLogger('bot')
 
 class ChannelSelectView(discord.ui.View):
     def __init__(self, bot, context: str):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.add_item(ChannelSelect(bot, context))
 
 class ChannelSelect(discord.ui.ChannelSelect):
@@ -658,7 +659,7 @@ class MinisterSchedule(commands.Cog):
 
             if not log_guild:
                 await interaction.followup.send(
-                    "Could not find the minister log guild. Make sure the bot is in that server.\n\nIf issue persists, run the `/settings` command --> Other Features --> Minister Scheduling --> Delete Server ID and try again in the desired server")
+                    "Couldn't find the server set for minister logs. Make sure the bot is still in that server.\n\nIf this keeps happening, run `/settings` --> Other Features --> Minister Scheduling --> Delete Server ID, then try again in the server you want to use.")
                 return
 
             # Check minister and log channels
@@ -791,8 +792,7 @@ class MinisterSchedule(commands.Cog):
                 alliance_name=alliance_name
             )
 
-            # Try to get the avatar image
-            avatar_image = "https://gof-formal-avatar.akamaized.net/avatar-dev/2023/07/17/1001.png"
+            avatar_image = await log_avatar_url(fid)
 
             # Send embed confirmation to log channel
             embed = discord.Embed(
@@ -846,7 +846,7 @@ class MinisterSchedule(commands.Cog):
 
             if not log_guild:
                 await interaction.followup.send(
-                    "Could not find the minister log guild. Make sure the bot is in that server.\n\nIf issue persists, run the `/settings` command --> Other Features --> Minister Scheduling --> Delete Server ID and try again in the desired server")
+                    "Couldn't find the server set for minister logs. Make sure the bot is still in that server.\n\nIf this keeps happening, run `/settings` --> Other Features --> Minister Scheduling --> Delete Server ID, then try again in the server you want to use.")
                 return
 
             # Check minister and log channels
@@ -931,8 +931,7 @@ class MinisterSchedule(commands.Cog):
                 alliance_name=alliance_name
             )
 
-            # Try to get the avatar image
-            avatar_image = "https://gof-formal-avatar.akamaized.net/avatar-dev/2023/07/17/1001.png"
+            avatar_image = await log_avatar_url(fid)
 
             # Send embed confirmation to log channel
             embed = discord.Embed(
@@ -977,6 +976,11 @@ class MinisterSchedule(commands.Cog):
         await interaction.response.defer()
 
         log_guild = await self.get_log_guild(interaction.guild)
+
+        if not log_guild:
+            await interaction.followup.send(
+                "Couldn't find the server set for minister logs. Make sure the bot is still in that server.\n\nIf this keeps happening, run `/settings` --> Other Features --> Minister Scheduling --> Delete Server ID, then try again in the server you want to use.")
+            return
 
         # Check minister log channels
         context = f"{appointment_type}"

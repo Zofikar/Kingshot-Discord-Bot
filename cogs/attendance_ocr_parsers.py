@@ -13,7 +13,8 @@ from typing import Optional
 
 import discord
 
-from .pimp_my_bot import theme
+from .pimp_my_bot import theme, menu_timeout
+from .permission_handler import can_edit_upload
 from . import alliance_power_changes
 
 logger = logging.getLogger("alliance")
@@ -33,7 +34,6 @@ class EventTypeConfig:
     default_keywords: tuple[str, ...]
     fingerprint_re_by_kind: dict[str, re.Pattern]
     event_weekday: Optional[int] = None
-    legion_required: bool = False
 
 
 # Shared anchors for foundry/canyon registration mails — anchored on event name later.
@@ -81,7 +81,6 @@ EVENT_TYPES: dict[str, EventTypeConfig] = {
             ),
         },
         event_weekday=6,
-        legion_required=True,
     ),
     "canyon_clash": EventTypeConfig(
         key="canyon_clash",
@@ -103,7 +102,6 @@ EVENT_TYPES: dict[str, EventTypeConfig] = {
             ),
         },
         event_weekday=5,
-        legion_required=True,
     ),
     "power_rankings": EventTypeConfig(
         key="power_rankings",
@@ -122,17 +120,6 @@ EVENT_TYPES: dict[str, EventTypeConfig] = {
         },
     ),
 }
-
-
-def fingerprint_match(event_type: str, ocr_text: str, kind: Optional[str] = None) -> bool:
-    """True if the event's fingerprint regex matches; `kind` narrows to one kind."""
-    cfg = EVENT_TYPES.get(event_type)
-    if cfg is None:
-        return False
-    if kind is not None:
-        regex = cfg.fingerprint_re_by_kind.get(kind)
-        return regex is not None and regex.search(ocr_text) is not None
-    return any(rx.search(ocr_text) for rx in cfg.fingerprint_re_by_kind.values())
 
 
 def detect_kind(event_type: str, ocr_text: str) -> Optional[str]:
@@ -807,15 +794,6 @@ def _parse_tail_rows(tail: str) -> list[dict]:
 def _name_noise(name: str) -> int:
     """Count digit-bearing tokens — a proxy for OCR junk like '48Z' or 'lII3'."""
     return sum(1 for t in (name or "").split() if any(c.isdigit() for c in t))
-
-
-def _cleaner_name(new: str, old: str) -> bool:
-    """True if `new` is a better OCR capture than `old`: fewer digit-noise
-    tokens first, then the longer (more complete) name."""
-    nn, on = _name_noise(new), _name_noise(old)
-    if nn != on:
-        return nn < on
-    return len(new or "") > len(old or "")
 
 
 # Name-like: a letter then word chars only ("BB_300", "lord235342323"). A
@@ -1682,6 +1660,8 @@ class OcrUploadSession:
                 pass
 
     def restart_timer(self):
+        if self.cancelled:
+            return
         self.stop_timer()
         self._timer_task = asyncio.create_task(self._timer_run())
 
@@ -1701,7 +1681,7 @@ class OcrUploadSession:
             pass
 
     async def render_progress(self):
-        if self.progress_message is None:
+        if self.progress_message is None or self.cancelled:
             return
         try:
             await self.progress_message.edit(
@@ -1864,21 +1844,34 @@ async def _safe_defer(interaction: discord.Interaction) -> None:
         pass
 
 
+def _review_editor_mode(channel_id: int) -> tuple:
+    """(alliance_id, editor mode) for the Screenshot Upload channel."""
+    from .attendance_ocr_setup import get_channel_settings, get_ocr_review_editors
+    settings = get_channel_settings(channel_id) or {}
+    alliance_id = settings.get("alliance_id") or 0
+    return alliance_id, (get_ocr_review_editors(alliance_id) if alliance_id else "uploader")
+
+
+async def can_edit_session(session, interaction: discord.Interaction) -> bool:
+    """Uploader, or whoever the alliance's Editors setting allows; denies with an ephemeral."""
+    if interaction.user.id == session.uploader_id:
+        return True
+    alliance_id, mode = _review_editor_mode(session.channel.id)
+    if can_edit_upload(interaction.user.id, session.uploader_id, mode, alliance_id, interaction.guild_id):
+        return True
+    await interaction.response.send_message(
+        f"{theme.deniedIcon} Only the uploader can change this. Admins can let others help "
+        f"with the Editors setting on the Screenshot Upload channel.", ephemeral=True)
+    return False
+
+
 class _ProgressView(discord.ui.View):
     def __init__(self, session: OcrUploadSession):
-        # Long timeout so the Done Uploading button stays clickable while
-        # the admin reads through the parsed counts before deciding.
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.session = session
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.session.uploader_id:
-            await interaction.response.send_message(
-                f"{theme.deniedIcon} Only the uploader can finalize this session.",
-                ephemeral=True,
-            )
-            return False
-        return True
+        return await can_edit_session(self.session, interaction)
 
     @discord.ui.button(label="Done Uploading", style=discord.ButtonStyle.success,
                        emoji=f"{theme.verifiedIcon}")
@@ -1954,6 +1947,8 @@ class PowerRankingsSession(OcrUploadSession):
     async def _process_attachments(self, attachments: list[discord.Attachment]):
         roster = load_alliance_roster(self.alliance_id)
         for att in attachments:
+            if self.cancelled:
+                break
             self.current_image_idx = self.processed_images + 1
             await self.render_progress()
             try:
@@ -2066,6 +2061,8 @@ class _PointsSession(OcrUploadSession):
         from . import bear_track
         roster = load_alliance_roster(self.alliance_id)
         for att in attachments:
+            if self.cancelled:
+                break
             self.current_image_idx = self.processed_images + 1
             await self.render_progress()
             try:
@@ -2325,6 +2322,8 @@ class AllianceShowdownSession(OcrUploadSession):
     async def _process_attachments(self, attachments: list[discord.Attachment]):
         roster = load_alliance_roster(self.alliance_id)
         for att in attachments:
+            if self.cancelled:
+                break
             self.current_image_idx = self.processed_images + 1
             await self.render_progress()
             try:

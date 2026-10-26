@@ -8,14 +8,17 @@ import asyncio
 import logging
 import re
 import sqlite3
+from contextlib import closing
 from datetime import datetime, timezone
 from typing import Optional
 
 import discord
 
-from .pimp_my_bot import theme
+from .pimp_my_bot import theme, menu_timeout, confirm_timeout, safe_edit_message
+from .attendance_ocr_parsers import can_edit_session
 from .bear_track import _isolate_rtl, _ltr_line
-from .alliance_member_edit import new_member_name, new_member_name_input
+from .alliance_member_edit import new_member_name_input, unknown_fid_refusal
+from .alliance_api_sync import look_up_new_member, store_new_member
 from . import alliance_power_changes
 from .attendance_ocr_parsers import (
     EVENT_TYPES,
@@ -33,7 +36,6 @@ from .attendance_ocr_parsers import (
     _close_session,
     delete_session,
     _find_or_create_session,
-    _record_session,
     _unmatched_id_floor,
     _normalize_for_match,
     learn_name_alias,
@@ -64,6 +66,24 @@ _ATTENDANCE_ICON = {
 # pick the stronger match label.
 _MATCH_PRIORITY = {"no_match": 0, "no_name": 0, "review": 1,
                    "likely": 2, "auto": 3, "manual": 3}
+
+# What the #number on a scoreboard card is called in this game.
+CARD_NUMBER_WORD = "Kingdom"
+
+
+def _card_name(card: dict) -> str:
+    tag = f"[{card['tag']}] " if card.get("tag") else ""
+    return f"{tag}{card.get('name') or ''}".strip()
+
+
+def _repeated_text(numbers: list[int]) -> Optional[str]:
+    """The '#449 is on more than one card.' sentence for numbers used twice, else None."""
+    repeated = sorted({n for n in numbers if numbers.count(n) > 1})
+    if not repeated:
+        return None
+    if len(repeated) == 1:
+        return f"{CARD_NUMBER_WORD} #{repeated[0]} is on more than one card."
+    return f"{CARD_NUMBER_WORD}s #{', #'.join(map(str, repeated))} are each on more than one card."
 
 
 def _format_int(n: Optional[int]) -> str:
@@ -100,7 +120,7 @@ class EventReviewView(discord.ui.View):
                  existing_session_id: Optional[str] = None,
                  enriching_open_session_id: Optional[str] = None,
                  edit_mode: bool = False):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.session = session
         # Opened from the settings/Mark flow to edit a saved session: each edit
         # autosaves, so we show Back instead of Submit/Cancel.
@@ -397,11 +417,11 @@ class EventReviewView(discord.ui.View):
             medal = ["🥇", "🥈", "🥉"]
             for i, sc in enumerate(self.session.alliance_scores):
                 m = medal[i] if i < len(medal) else "•"
-                tag = f"[{sc['tag']}]" if sc.get("tag") else ""
-                name = sc.get("name") or ""
                 legion = f" · {sc['legion']}" if sc.get("legion") else ""
+                number = (f"#{sc['rank']}" if sc.get("rank") is not None
+                          else f"{theme.warnIcon} {CARD_NUMBER_WORD.lower()} number missing")
                 desc_lines.append(
-                    f"{m} #{sc['rank']} {tag}{name} — `{_format_int(sc.get('score'))}`{legion}"
+                    f"{m} {number} {_card_name(sc)} — `{_format_int(sc.get('score'))}`{legion}"
                 )
 
         if self.session.stats:
@@ -806,6 +826,9 @@ class EventReviewView(discord.ui.View):
                 ("Submit", theme.verifiedIcon, discord.ButtonStyle.success, self._on_submit),
                 ("Cancel", theme.deniedIcon, discord.ButtonStyle.danger, self._on_cancel),
             ]
+        if self.session.alliance_scores:
+            row3.insert(0, ("Edit Scoreboard", theme.shieldIcon, discord.ButtonStyle.secondary,
+                            self._on_edit_scoreboard))
         for label, emoji, style, cb in row3:
             btn = discord.ui.Button(label=label, emoji=emoji, style=style, row=3)
             btn.callback = cb
@@ -814,13 +837,7 @@ class EventReviewView(discord.ui.View):
     # ── interaction guards ────────────────────────────────────────────────
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id != self.session.uploader_id:
-            await interaction.response.send_message(
-                f"{theme.deniedIcon} Only the uploader can edit this review.",
-                ephemeral=True,
-            )
-            return False
-        return True
+        return await can_edit_session(self.session, interaction)
 
     async def on_timeout(self):
         """Replace the big review embed with a small expiry notice so the
@@ -892,6 +909,9 @@ class EventReviewView(discord.ui.View):
 
     async def _on_edit_header(self, interaction: discord.Interaction):
         await interaction.response.send_modal(_EditEventInfoModal(self))
+
+    async def _on_edit_scoreboard(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(_EditScoreboardModal(self))
 
     async def _on_set_time(self, interaction: discord.Interaction):
         allowed = _allowed_time_slots(self.session.db_event_type)
@@ -976,7 +996,24 @@ class EventReviewView(discord.ui.View):
                 except Exception:
                     pass
 
+    def _scoreboard_problem(self) -> Optional[str]:
+        """Why the scoreboard can't be saved yet: each card is stored under its own number."""
+        cards = self.session.alliance_scores
+        word = CARD_NUMBER_WORD.lower()
+        missing = [_card_name(sc) for sc in cards if sc.get("rank") is None]
+        if missing:
+            return (f"{theme.warnIcon} The {word} number is missing for {', '.join(missing)}. "
+                    f"Use **Edit Scoreboard** to fill it in, then Submit again.")
+        repeated = _repeated_text([sc["rank"] for sc in cards])
+        if repeated:
+            return f"{theme.warnIcon} {repeated} Use **Edit Scoreboard** to correct it, then Submit again."
+        return None
+
     async def _on_submit(self, interaction: discord.Interaction):
+        problem = self._scoreboard_problem()
+        if problem:
+            await interaction.response.send_message(problem, ephemeral=True)
+            return
         # Defer first: a power snapshot updates every member and can exceed the 3s window.
         if not interaction.response.is_done():
             await interaction.response.defer()
@@ -1038,6 +1075,7 @@ class EventReviewView(discord.ui.View):
                 conn.execute(
                     "UPDATE attendance_sessions SET awaiting_result = 1 "
                     "WHERE session_id = ?", (session_id,))
+                self._update_session_date_legion(conn, session_id)
                 # Re-upload rebuilds the event; clear prior result rows so they
                 # don't accumulate.
                 conn.execute(
@@ -1126,14 +1164,26 @@ class EventReviewView(discord.ui.View):
         self._power_updated_count = count
         return None
 
-    def _persist_registration_only(self, update_fn, ts: str) -> str:
-        session_id = _find_or_create_session(
-            event_type=self.session.db_event_type,
-            event_date=self.session.detected_date,
-            event_subtype=self.session.detected_legion,
-            alliance_id=self.session.alliance_id,
-            date_confidence=self.session.date_confidence,
+    def _update_session_date_legion(self, conn, session_id: str) -> None:
+        event_date = self.session.detected_date
+        conn.execute(
+            "UPDATE attendance_sessions "
+            "SET event_date = COALESCE(?, event_date), event_subtype = ? WHERE session_id = ?",
+            (event_date.isoformat() if event_date else None,
+             self.session.detected_legion, session_id),
         )
+
+    def _persist_registration_only(self, update_fn, ts: str) -> str:
+        if self.existing_session_id is not None:
+            session_id = self.existing_session_id
+        else:
+            session_id = _find_or_create_session(
+                event_type=self.session.db_event_type,
+                event_date=self.session.detected_date,
+                event_subtype=self.session.detected_legion,
+                alliance_id=self.session.alliance_id,
+                date_confidence=self.session.date_confidence,
+            )
         self._write_registered_rows(session_id, update_fn, ts)
         with sqlite3.connect("db/attendance.sqlite", timeout=30.0) as conn:
             conn.execute(
@@ -1141,6 +1191,8 @@ class EventReviewView(discord.ui.View):
                 "SET alliance_rank = ?, event_time = ? WHERE session_id = ?",
                 (self.session.alliance_rank, self.session.detected_time, session_id),
             )
+            if self.existing_session_id is not None:
+                self._update_session_date_legion(conn, session_id)
             conn.commit()
         return session_id
 
@@ -1246,15 +1298,6 @@ class EventReviewView(discord.ui.View):
 
     # ── scoreboard embed ──────────────────────────────────────────────────
 
-    def _total_absent_for_session(self, session_id: str) -> int:
-        with sqlite3.connect("db/attendance.sqlite", timeout=30.0) as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM attendance_records "
-                "WHERE session_id = ? AND status = 'absent'",
-                (session_id,),
-            ).fetchone()
-        return int(row[0]) if row else 0
-
     def _previous_event_total(self, session_id: str) -> Optional[int]:
         with sqlite3.connect("db/attendance.sqlite", timeout=30.0) as conn:
             prior = conn.execute(
@@ -1338,11 +1381,9 @@ class EventReviewView(discord.ui.View):
             medal = ["🥇", "🥈", "🥉"]
             for i, sc in enumerate(self.session.alliance_scores):
                 m = medal[i] if i < len(medal) else "•"
-                tag = f"[{sc['tag']}]" if sc.get("tag") else ""
-                name = sc.get("name") or ""
                 own = " **(you)**" if self._is_own_scoreboard_entry(sc) else ""
                 desc.append(
-                    f"{m} #{sc['rank']} {tag}{name}{own} — `{_format_int(sc.get('score'))}`"
+                    f"{m} #{sc['rank']} {_card_name(sc)}{own} — `{_format_int(sc.get('score'))}`"
                 )
             desc.append("")
 
@@ -1465,7 +1506,7 @@ class _ConfirmDeleteEventView(discord.ui.View):
     """Ephemeral-style inline confirm for deleting a saved event."""
 
     def __init__(self, parent: "EventReviewView"):
-        super().__init__(timeout=60)
+        super().__init__(timeout=confirm_timeout())
         self.parent = parent
         confirm = discord.ui.Button(
             label="Delete", emoji=theme.trashIcon, style=discord.ButtonStyle.danger)
@@ -1494,7 +1535,7 @@ class _StatsMvpEditView(discord.ui.View):
     a time. Pick a stat -> a modal edits its total + MVP together."""
 
     def __init__(self, parent: "EventReviewView"):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.parent = parent
         self._build()
 
@@ -1556,7 +1597,7 @@ class _StatsMvpEditView(discord.ui.View):
 
     async def rerender(self, interaction: discord.Interaction):
         self._build()
-        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+        await safe_edit_message(interaction, embed=self.build_embed(), view=self)
 
 
 # ── modals ────────────────────────────────────────────────────────────────
@@ -1589,7 +1630,6 @@ async def _resolve_player_field(interaction: discord.Interaction,
 
 async def _add_unknown_fid(interaction, view, fid, new_name=None):
     """Add a kingdom-checked unknown fid under `new_name` -> (added, nickname, note); never moves other alliances' players."""
-    from . import gift_state_resolver
     alliance_id = view.session.alliance_id
     with sqlite3.connect("db/users.sqlite", timeout=30.0) as conn:
         row = conn.execute("SELECT alliance FROM users WHERE fid = ?", (fid,)).fetchone()
@@ -1597,25 +1637,23 @@ async def _add_unknown_fid(interaction, view, fid, new_name=None):
         if str(row[0]) == str(alliance_id):
             return False, None, f"{theme.warnIcon} ID `{fid}` is already in this alliance."
         return False, None, f"{theme.warnIcon} ID `{fid}` is in another alliance. Not moved."
-    gift_cog = interaction.client.get_cog("GiftOperations")
-    if gift_cog is None:
-        return False, None, f"{theme.deniedIcon} Gift Codes is unavailable, so I can't verify ID `{fid}`."
-    alliance_kid = await asyncio.to_thread(gift_state_resolver.get_alliance_kid, alliance_id)
-    if alliance_kid is None:
-        return False, None, (f"{theme.warnIcon} This alliance has no kingdom set, so I can't confirm ID `{fid}`. "
-                             f"Add them under Alliance Management first.")
-    kid, verified = await gift_state_resolver.verify_add_state(gift_cog, fid, alliance_id)
-    if not verified:
-        return False, None, (f"{theme.deniedIcon} Couldn't confirm ID `{fid}` in kingdom `{alliance_kid}`. "
-                             f"They may be in another kingdom, or the ID is wrong. Add them under Alliance Management first.")
-    nick = new_member_name(new_name, fid)
-    with sqlite3.connect("db/users.sqlite", timeout=30.0) as conn:
+    member = await look_up_new_member(interaction.client, fid, alliance_id, new_name)
+    refusal = await unknown_fid_refusal(interaction.client, alliance_id, fid, member)
+    if refusal:
+        return False, None, refusal
+    await asyncio.to_thread(_insert_member, fid, member, alliance_id)
+    await store_new_member(member, fid)
+    nick = member.nickname
+    return True, nick, f"{theme.verifiedIcon} Added **{_isolate_rtl(nick)}** (ID `{fid}`) to the alliance and matched the row."
+
+
+def _insert_member(fid, member, alliance_id):
+    with closing(sqlite3.connect("db/users.sqlite", timeout=30.0)) as conn:
         conn.execute(
             "INSERT INTO users (fid, nickname, furnace_lv, kid, stove_lv_content, alliance) "
-            "VALUES (?, ?, 0, ?, '', ?)",
-            (fid, nick, str(kid), str(alliance_id)))
+            "VALUES (?, ?, ?, ?, '', ?)",
+            (fid, member.nickname, member.furnace_lv, str(member.kid), str(alliance_id)))
         conn.commit()
-    return True, nick, f"{theme.verifiedIcon} Added **{_isolate_rtl(nick)}** (ID `{fid}`) to the alliance and matched the row."
 
 
 class _StatEditModal(discord.ui.Modal):
@@ -1682,8 +1720,12 @@ class _StatEditModal(discord.ui.Modal):
                 parent._persist()
             except Exception as e:
                 logger.exception("Attendance stat/MVP autosave failed")
-                await interaction.response.send_message(
-                    f"{theme.deniedIcon} Couldn't save: {e}", ephemeral=True)
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        f"{theme.deniedIcon} Couldn't save: {e}", ephemeral=True)
+                else:
+                    await interaction.response.send_message(
+                        f"{theme.deniedIcon} Couldn't save: {e}", ephemeral=True)
                 return
 
         await self.sub_view.rerender(interaction)
@@ -1914,7 +1956,7 @@ class _AddRowBucketView(discord.ui.View):
     """Bucket picker shown only in complete mode."""
 
     def __init__(self, parent: EventReviewView):
-        super().__init__(timeout=120)
+        super().__init__(timeout=menu_timeout())
         self.parent = parent
 
         reg_btn = discord.ui.Button(
@@ -2002,11 +2044,45 @@ class _EditEventInfoModal(discord.ui.Modal):
         await self.view._save_edit(interaction)
 
 
+class _EditScoreboardModal(discord.ui.Modal):
+    """One field per scoreboard card, for a #number the screenshot reader missed or misread."""
+
+    def __init__(self, view: EventReviewView):
+        super().__init__(title="Edit Scoreboard")
+        self.view = view
+        self.fields = []
+        for card in view.session.alliance_scores[:5]:
+            field = discord.ui.TextInput(
+                label=f"{CARD_NUMBER_WORD} number: {_card_name(card)}"[:45],
+                default=str(card["rank"]) if card.get("rank") is not None else "",
+                placeholder="e.g. 449", required=True, max_length=6,
+            )
+            self.add_item(field)
+            self.fields.append((card, field))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        raw = [field.value.strip() for _, field in self.fields]
+        if not all(value.isdigit() and int(value) > 0 for value in raw):
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} Each {CARD_NUMBER_WORD.lower()} number must be a whole number, "
+                f"like 449.", ephemeral=True)
+            return
+        numbers = [int(value) for value in raw]
+        repeated = _repeated_text(numbers)
+        if repeated:
+            await interaction.response.send_message(
+                f"{theme.deniedIcon} {repeated} Each card needs its own number.", ephemeral=True)
+            return
+        for (card, _), number in zip(self.fields, numbers):
+            card["rank"] = number
+        await self.view._save_edit(interaction)
+
+
 class _TimeSlotPickerView(discord.ui.View):
     """Ephemeral UTC time-slot dropdown."""
 
     def __init__(self, parent: EventReviewView, slots: tuple[str, ...]):
-        super().__init__(timeout=120)
+        super().__init__(timeout=menu_timeout())
         self.parent = parent
         current = parent.session.detected_time
         options = [

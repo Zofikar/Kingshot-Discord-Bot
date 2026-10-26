@@ -7,13 +7,13 @@ import sqlite3
 import logging
 from datetime import datetime
 import json
-from .pimp_my_bot import theme, safe_edit_message
+from .pimp_my_bot import theme, safe_edit_message, menu_timeout, confirm_timeout, check_interaction_user
 
 logger = logging.getLogger('bot')
 
 class ArchiveDetailsView(discord.ui.View):
     def __init__(self, bot, cog, archive_id, archive_info, type_counts):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.bot = bot
         self.cog = cog
         self.archive_id = archive_id
@@ -46,7 +46,7 @@ class ArchiveDetailsView(discord.ui.View):
 
 class ArchiveAppointmentsView(discord.ui.View):
     def __init__(self, bot, cog, archive_id, appointment_type, appointments, page=0):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.bot = bot
         self.cog = cog
         self.archive_id = archive_id
@@ -118,7 +118,7 @@ class ArchiveAppointmentsView(discord.ui.View):
 
 class ArchiveListView(discord.ui.View):
     def __init__(self, bot, cog, archives, page=0):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.bot = bot
         self.cog = cog
         self.archives = archives
@@ -203,11 +203,15 @@ class ArchiveListView(discord.ui.View):
         await self.cog.show_archive_menu(interaction)
 
 class ClearAfterSaveView(discord.ui.View):
-    def __init__(self, bot, cog, archive_id):
-        super().__init__(timeout=7200)
+    def __init__(self, bot, cog, archive_id, original_user_id):
+        super().__init__(timeout=menu_timeout())
         self.bot = bot
         self.cog = cog
         self.archive_id = archive_id
+        self.original_user_id = original_user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await check_interaction_user(interaction, self.original_user_id)
 
     @discord.ui.button(label="Yes, Clear All", style=discord.ButtonStyle.danger, emoji=f"{theme.trashIcon}")
     async def yes_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -225,7 +229,7 @@ class ClearAfterSaveView(discord.ui.View):
 
 class DeleteArchiveConfirmView(discord.ui.View):
     def __init__(self, bot, cog, archive_id, archive_info):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=confirm_timeout())
         self.bot = bot
         self.cog = cog
         self.archive_id = archive_id
@@ -263,7 +267,7 @@ class PostArchiveChannelSelect(discord.ui.ChannelSelect):
 
 class PostArchiveChannelView(discord.ui.View):
     def __init__(self, bot, cog, archive_id, appointment_type, appointments):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.bot = bot
         self.cog = cog
         self.archive_id = archive_id
@@ -303,7 +307,7 @@ class SaveArchiveModal(discord.ui.Modal, title="Save Minister Schedule Archive")
 
 class ArchiveMenuView(discord.ui.View):
     def __init__(self, bot, cog):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.bot = bot
         self.cog = cog
 
@@ -328,7 +332,7 @@ class ArchiveMenuView(discord.ui.View):
 
 class ChangeHistoryView(discord.ui.View):
     def __init__(self, bot, cog, history_records, page=0, archive_id=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.bot = bot
         self.cog = cog
         self.history_records = history_records
@@ -585,7 +589,7 @@ class MinisterArchive(commands.Cog):
             )
             embed.set_footer(text=f"Created at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-            view = ClearAfterSaveView(self.bot, self, archive_id)
+            view = ClearAfterSaveView(self.bot, self, archive_id, interaction.user.id)
             await interaction.followup.send(embed=embed, view=view)
 
         except Exception as e:
@@ -669,6 +673,13 @@ class MinisterArchive(commands.Cog):
             print(f"Error clearing appointments: {e}")
             await interaction.followup.send(f"{theme.deniedIcon} Error clearing appointments: {e}", ephemeral=True)
 
+    async def show_in_place(self, interaction: discord.Interaction, embed, view):
+        # Slash commands have no message to edit, so they open a new ephemeral
+        if interaction.type == discord.InteractionType.application_command and not interaction.response.is_done():
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        else:
+            await safe_edit_message(interaction, embed=embed, view=view)
+
     async def show_archive_list(self, interaction: discord.Interaction):
         """Show list of all archives"""
         try:
@@ -693,7 +704,7 @@ class MinisterArchive(commands.Cog):
                     description="No archives found.\n\nUse the **Save Current Schedule** button to create your first archive.",
                     color=theme.emColor1
                 )
-                view = discord.ui.View(timeout=7200)
+                view = discord.ui.View(timeout=menu_timeout())
                 back_button = discord.ui.Button(label="Back", style=discord.ButtonStyle.primary, emoji=f"{theme.backIcon}")
 
                 async def back_callback(inter: discord.Interaction):
@@ -702,10 +713,7 @@ class MinisterArchive(commands.Cog):
                 back_button.callback = back_callback
                 view.add_item(back_button)
 
-                if not interaction.response.is_done():
-                    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-                else:
-                    await interaction.response.edit_message(embed=embed, view=view)
+                await self.show_in_place(interaction, embed, view)
                 return
 
             embed = discord.Embed(
@@ -715,11 +723,7 @@ class MinisterArchive(commands.Cog):
             )
 
             view = ArchiveListView(self.bot, self, archives)
-
-            if not interaction.response.is_done():
-                await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-            else:
-                await interaction.response.edit_message(embed=embed, view=view)
+            await self.show_in_place(interaction, embed, view)
 
         except Exception as e:
             logger.error(f"Error loading archives: {e}")
@@ -797,7 +801,7 @@ class MinisterArchive(commands.Cog):
                     description=f"No appointments found for {appointment_type} in this archive.",
                     color=theme.emColor1
                 )
-                view = discord.ui.View(timeout=7200)
+                view = discord.ui.View(timeout=menu_timeout())
                 back_button = discord.ui.Button(label="Back", style=discord.ButtonStyle.primary, emoji=f"{theme.backIcon}")
 
                 async def back_callback(inter: discord.Interaction):
@@ -1120,7 +1124,7 @@ class MinisterArchive(commands.Cog):
                     description="No change history found.",
                     color=theme.emColor1
                 )
-                view = discord.ui.View(timeout=7200)
+                view = discord.ui.View(timeout=menu_timeout())
                 back_button = discord.ui.Button(label="Back", style=discord.ButtonStyle.primary, emoji=f"{theme.backIcon}")
 
                 async def back_callback(inter: discord.Interaction):
@@ -1199,11 +1203,7 @@ class MinisterArchive(commands.Cog):
             color=theme.emColor1
         )
         embed.set_footer(text=f"Page {page + 1}/{((len(history_records) - 1) // 25) + 1} • Total: {len(history_records)} changes")
-
-        if not interaction.response.is_done():
-            await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
-        else:
-            await interaction.response.edit_message(embed=embed, view=view)
+        await self.show_in_place(interaction, embed, view)
 
 async def setup(bot):
     await bot.add_cog(MinisterArchive(bot))

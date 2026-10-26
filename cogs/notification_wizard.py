@@ -9,17 +9,16 @@ from datetime import datetime, timedelta
 import pytz
 import os
 from typing import Dict
-import uuid
 import sys
 sys.path.insert(0, os.path.dirname(__file__))
 from notification_event_types import (
     get_event_icon, get_event_config, calculate_next_occurrence, validate_time_slot,
     get_instance_defaults, get_instance_display_name,
     calculate_viking_vengeance_dates, get_reference_override, set_reference_override,
-    cycle_repeat_minutes
+    cycle_repeat_minutes, first_future_occurrence, get_timezone, utc_offset_zone_name
 )
 from .permission_handler import PermissionManager
-from .pimp_my_bot import theme
+from .pimp_my_bot import theme, menu_timeout
 
 logger = logging.getLogger('notification')
 
@@ -105,13 +104,29 @@ class NotificationWizard(commands.Cog):
 
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
+# Wizard entry for these is in the session timezone; every other event time is shown and stored as UTC.
+LOCAL_TIME_EVENTS = ("Bear Trap", "Viking Vengeance")
+
+
+def entry_zone(session) -> tuple[str, str]:
+    """(label suffix, placeholder note) naming the timezone Bear Trap/Viking Vengeance times are entered in."""
+    if session.timezone == "UTC":
+        return "UTC", "UTC"
+    return "local", session.timezone
+
+
+def _next_bear_trap_start(start: datetime, tz, repeat_days: int | None = None,
+                          weekdays: list | None = None) -> datetime:
+    now = datetime.now(tz).replace(tzinfo=None)
+    return tz.localize(first_future_occurrence(start.replace(tzinfo=None), now, repeat_days, weekdays))
+
+
 class WizardSession:
     """Stores wizard session data"""
     def __init__(self, cog, guild_id: int, user_id: int):
         self.cog = cog
         self.guild_id = guild_id
         self.user_id = user_id
-        self.wizard_run_id = str(uuid.uuid4())
         self.wizard_batch_id = None
         self.is_update = False
         self.existing_notifications = {}
@@ -210,7 +225,8 @@ class WizardSession:
 
         # Load global settings from first notification
         first_notif = notifications[0]
-        self.timezone = first_notif.get("timezone", "UTC")
+        local_notif = next((n for n in notifications if n.get("event_type") in LOCAL_TIME_EVENTS), first_notif)
+        self.timezone = local_notif.get("timezone") or "UTC"
         self.mention_type = first_notif.get("mention_type")
 
         # Only set notification_type if it's not the default (2)
@@ -339,7 +355,7 @@ class WizardSession:
 
 class WizardWelcomeView(discord.ui.View):
     def __init__(self, cog: NotificationWizard, session: WizardSession):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
 
@@ -362,7 +378,7 @@ class WizardWelcomeView(discord.ui.View):
 class CommonSettingsHubView(discord.ui.View):
     """Step 1: Configure common settings (channel, mention, notification times, timezone)"""
     def __init__(self, cog: NotificationWizard, session: WizardSession):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
 
@@ -419,7 +435,7 @@ class CommonSettingsHubView(discord.ui.View):
                 "- Specify who should be mentioned in the notifications.\n\n"
                 "**You might also want to adjust some optional settings:**\n"
                 "- When the bot will send notifications before an event. 10m and 5m before and at the event time by default.\n"
-                "- The timezone for the event times. UTC by default.\n\n"
+                "- The timezone you enter Bear Trap and Viking Vengeance times in. UTC by default. Other events always use UTC.\n\n"
                 "**Required Settings:**\n"
                 f"{theme.pinIcon} **Channel:** {channel_status}{channel_name}\n"
                 f"{theme.announceIcon} **Mention:** {mention_status}{mention_desc}\n\n"
@@ -521,7 +537,7 @@ class CommonSettingsHubView(discord.ui.View):
 class WizardChannelSelectView(discord.ui.View):
     """Channel selection for wizard"""
     def __init__(self, cog: NotificationWizard, session: WizardSession, parent_view: CommonSettingsHubView):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
         self.parent_view = parent_view
@@ -559,7 +575,7 @@ class WizardChannelSelectView(discord.ui.View):
 class WizardMentionSelectView(discord.ui.View):
     """Mention type selection for wizard"""
     def __init__(self, cog: NotificationWizard, session: WizardSession, parent_view: CommonSettingsHubView):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
         self.parent_view = parent_view
@@ -637,7 +653,7 @@ class WizardMentionSelectView(discord.ui.View):
             await self.parent_view.show(select_interaction)
 
         role_select.callback = role_callback
-        view = discord.ui.View(timeout=7200)
+        view = discord.ui.View(timeout=menu_timeout())
         view.add_item(role_select)
 
         embed = discord.Embed(
@@ -661,7 +677,7 @@ class WizardMentionSelectView(discord.ui.View):
             await self.parent_view.show(select_interaction)
 
         member_select.callback = member_callback
-        view = discord.ui.View(timeout=7200)
+        view = discord.ui.View(timeout=menu_timeout())
         view.add_item(member_select)
 
         embed = discord.Embed(
@@ -674,7 +690,7 @@ class WizardMentionSelectView(discord.ui.View):
 class WizardNotificationTypeView(discord.ui.View):
     """Notification times selection for wizard"""
     def __init__(self, cog: NotificationWizard, session: WizardSession, parent_view: CommonSettingsHubView):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
         self.parent_view = parent_view
@@ -823,36 +839,11 @@ class WizardTimezoneModal(discord.ui.Modal, title="Set Timezone"):
         """Validate and save timezone"""
         try:
             tz_input = self.timezone_input.value.strip()
-
-            # Convert UTC+X or UTC-X to appropriate timezone format
-            if tz_input.upper() == "UTC":
-                tz_name = "UTC"
-            elif tz_input.upper().startswith("UTC+") or tz_input.upper().startswith("UTC-"):
-                # Extract offset
-                offset_str = tz_input[3:]  # Remove "UTC"
-
-                # Parse offset - support both formats
-                if ':' in offset_str:
-                    # HH:MM format
-                    parts = offset_str.split(':')
-                    hours = int(parts[0])
-                    minutes = int(parts[1])
-                    offset = hours + (minutes / 60.0 if hours >= 0 else -minutes / 60.0)
-                else:
-                    # Decimal format
-                    offset = float(offset_str)
-
-                # Convert to Etc/GMT timezone (note: Etc/GMT has inverted signs)
-                if offset >= 0:
-                    tz_name = f"Etc/GMT-{int(offset)}"
-                else:
-                    tz_name = f"Etc/GMT+{int(abs(offset))}"
+            if tz_input.upper().startswith("UTC"):
+                tz_name = utc_offset_zone_name(tz_input)
             else:
-                # Try as pytz timezone
                 tz_name = tz_input
-
-            # Validate timezone
-            pytz.timezone(tz_name)
+                pytz.timezone(tz_name)
             self.session.timezone = tz_name
 
             # Return to hub
@@ -914,7 +905,7 @@ class EventRotationView(discord.ui.View):
     """Per-server rotation overrides so event dates match servers on a different cycle."""
 
     def __init__(self, cog, session, hub_view):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
         self.hub_view = hub_view
@@ -978,7 +969,7 @@ class EventRotationView(discord.ui.View):
 class EventSelectionHubView(discord.ui.View):
     """Step 2: Select and configure events - returns here after each event config"""
     def __init__(self, cog: NotificationWizard, session: WizardSession):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
 
@@ -1179,9 +1170,10 @@ class BearTrapModal(discord.ui.Modal):
         )
         self.add_item(self.bt1_date)
 
+        zone_label, zone_note = entry_zone(session)
         self.bt1_time = discord.ui.TextInput(
-            label="Bear Trap 1 Time (HH:MM)",
-            placeholder="e.g., 14:00",
+            label=f"Bear Trap 1 Time (HH:MM {zone_label})",
+            placeholder=f"e.g., 14:00 ({zone_note})",
             default=bt1_time_default,
             max_length=5
         )
@@ -1196,8 +1188,8 @@ class BearTrapModal(discord.ui.Modal):
         self.add_item(self.bt2_date)
 
         self.bt2_time = discord.ui.TextInput(
-            label="Bear Trap 2 Time (HH:MM)",
-            placeholder="e.g., 18:00",
+            label=f"Bear Trap 2 Time (HH:MM {zone_label})",
+            placeholder=f"e.g., 18:00 ({zone_note})",
             default=bt2_time_default,
             max_length=5
         )
@@ -1216,7 +1208,7 @@ class BearTrapModal(discord.ui.Modal):
         """Process Bear Trap configuration"""
         try:
             # Validate and parse dates/times
-            tz = pytz.timezone(self.session.timezone)
+            tz = get_timezone(self.session.timezone)
             now = datetime.now(tz)
             current_year = now.year
 
@@ -1224,10 +1216,7 @@ class BearTrapModal(discord.ui.Modal):
             bt1_day, bt1_month = map(int, self.bt1_date.value.split("/"))
             bt1_hour, bt1_minute = map(int, self.bt1_time.value.split(":"))
 
-            # Determine year - if date is in the past, use next year
             bt1_datetime = tz.localize(datetime(current_year, bt1_month, bt1_day, bt1_hour, bt1_minute))
-            if bt1_datetime < now:
-                bt1_datetime = tz.localize(datetime(current_year + 1, bt1_month, bt1_day, bt1_hour, bt1_minute))
 
             # Parse Bear 2 date (use Bear 1 date if not provided)
             if self.bt2_date.value.strip():
@@ -1238,10 +1227,7 @@ class BearTrapModal(discord.ui.Modal):
 
             bt2_hour, bt2_minute = map(int, self.bt2_time.value.split(":"))
 
-            # Determine year for Bear 2
             bt2_datetime = tz.localize(datetime(current_year, bt2_month, bt2_day, bt2_hour, bt2_minute))
-            if bt2_datetime < now:
-                bt2_datetime = tz.localize(datetime(current_year + 1, bt2_month, bt2_day, bt2_hour, bt2_minute))
 
             # Validate 5-minute slots
             if bt1_minute % 5 != 0 or bt2_minute % 5 != 0:
@@ -1267,6 +1253,10 @@ class BearTrapModal(discord.ui.Modal):
                     ephemeral=True
                 )
                 return
+
+            if repeat_answer == "yes":
+                bt1_datetime = _next_bear_trap_start(bt1_datetime, tz, repeat_days=2)
+                bt2_datetime = _next_bear_trap_start(bt2_datetime, tz, repeat_days=2)
 
             # Save data
             self.session.bear_trap_data = {
@@ -1297,7 +1287,7 @@ class BearTrapModal(discord.ui.Modal):
 class BearTrapWeekdayView(discord.ui.View):
     """Select custom weekdays for Bear Trap repeat schedule"""
     def __init__(self, cog: NotificationWizard, session: WizardSession, hub_view: EventSelectionHubView):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
         self.hub_view = hub_view
@@ -1357,7 +1347,11 @@ class BearTrapWeekdayView(discord.ui.View):
     async def continue_to_next(self, interaction: discord.Interaction):
         """Save selected days and continue"""
         # Update session data with selected weekdays
-        self.session.bear_trap_data["repeat_weekdays"] = sorted(self.selected_days)
+        data = self.session.bear_trap_data
+        data["repeat_weekdays"] = sorted(self.selected_days)
+        tz = get_timezone(self.session.timezone)
+        for key in ("bt1_datetime", "bt2_datetime"):
+            data[key] = _next_bear_trap_start(data[key], tz, weekdays=data["repeat_weekdays"])
         # Mark as configured and return to hub
         self.session.mark_event_configured("Bear Trap")
         await self.hub_view.show(interaction)
@@ -1392,9 +1386,10 @@ class VikingVengeanceModal(discord.ui.Modal):
         if existing.get("thursday_hour") is not None:
             thursday_default = f"{existing['thursday_hour']:02d}:{existing['thursday_minute']:02d}"
 
+        zone_label, zone_note = entry_zone(session)
         self.tuesday_time = discord.ui.TextInput(
-            label="Tuesday Time (HH:MM)",
-            placeholder="e.g., 19:00",
+            label=f"Tuesday Time (HH:MM {zone_label})",
+            placeholder=f"e.g., 19:00 ({zone_note})",
             default=tuesday_default,
             max_length=5,
             required=True
@@ -1402,7 +1397,7 @@ class VikingVengeanceModal(discord.ui.Modal):
         self.add_item(self.tuesday_time)
 
         self.thursday_time = discord.ui.TextInput(
-            label="Thursday Time (HH:MM, optional)",
+            label=f"Thursday Time (HH:MM {zone_label}, optional)",
             placeholder="Leave blank for same as Tuesday",
             default=thursday_default,
             max_length=5,
@@ -1450,7 +1445,7 @@ class VikingVengeanceModal(discord.ui.Modal):
 class DualLegionConfigView(discord.ui.View):
     """Base class for dual-legion event configuration (Swordland Showdown, Tri-Alliance Clash)"""
     def __init__(self, cog: NotificationWizard, session: WizardSession, hub_view: EventSelectionHubView, event_name: str, session_data_attr: str):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
         self.hub_view = hub_view
@@ -1629,7 +1624,7 @@ class MultiTimeSelectView(discord.ui.View):
     """Base class for multi-time selection events (Fortress Battle, Eternity's Reach)"""
     def __init__(self, cog: NotificationWizard, session: WizardSession, hub_view: EventSelectionHubView,
                  event_name: str, session_data_attr: str, buttons_per_row: int = 5):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
         self.hub_view = hub_view
@@ -1751,7 +1746,7 @@ class PhaseToggleConfigView(discord.ui.View):
         phases: List of dicts with keys: 'name', 'emoji', 'time', 'phase_key', 'hour', 'minute'
         Example: [{"name": "Borders Open", "emoji": "🌍", "time": "10:00 UTC", "phase_key": "borders_open", "hour": 10, "minute": 0}]
         """
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
         self.hub_view = hub_view
@@ -1879,7 +1874,7 @@ class KvKConfigView(PhaseToggleConfigView):
 class CaesaresFuryConfigView(discord.ui.View):
     """Configuration for Caesares Fury (up to 5 instances during 3-day window)"""
     def __init__(self, cog: NotificationWizard, session: WizardSession, hub_view: EventSelectionHubView):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
         self.hub_view = hub_view
@@ -1905,7 +1900,6 @@ class CaesaresFuryConfigView(discord.ui.View):
         window_text = "N/A"
         if next_date:
             day1 = next_date.strftime('%B %d')
-            day2 = (next_date + timedelta(days=1)).strftime('%B %d')
             day3 = (next_date + timedelta(days=2)).strftime('%B %d, %Y')
             window_text = f"{day1} - {day3}"
 
@@ -2207,7 +2201,7 @@ class DailyResetConfigView:
 class WizardPreviewView(discord.ui.View):
     """Preview all notifications before creation"""
     def __init__(self, cog: NotificationWizard, session: WizardSession):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
 
@@ -2439,6 +2433,7 @@ class WizardPreviewView(discord.ui.View):
         """
         # Look for existing notification with this event_type and instance_identifier
         existing = self.session.original_instance_states.get((event_name, instance_id))
+        timezone = self.session.timezone if event_name in LOCAL_TIME_EVENTS else "UTC"
 
         if existing:
             # UPDATE existing notification
@@ -2446,7 +2441,7 @@ class WizardPreviewView(discord.ui.View):
                 notification_id=existing["id"],
                 hour=hour,
                 minute=minute,
-                timezone=self.session.timezone,
+                timezone=timezone,
                 description=description,
                 notification_type=self.session.notification_type,
                 mention_type=self.session.mention_type,
@@ -2473,7 +2468,7 @@ class WizardPreviewView(discord.ui.View):
                 start_date=start_date,
                 hour=hour,
                 minute=minute,
-                timezone=self.session.timezone,
+                timezone=timezone,
                 description=description,
                 created_by=interaction.user.id,
                 notification_type=self.session.notification_type,
@@ -2519,14 +2514,12 @@ class WizardPreviewView(discord.ui.View):
                 )
                 return
 
-            created_count = 0
             updated_count = 0
-            disabled_count = 0
             event_changes = {}
             from datetime import datetime, timedelta
             import pytz
 
-            tz = pytz.timezone(self.session.timezone)
+            tz = get_timezone(self.session.timezone)
             now = datetime.now(tz)
 
             # Set default notification_type if not set (type 2 = 10, 5, 0 minutes before)
@@ -2549,7 +2542,6 @@ class WizardPreviewView(discord.ui.View):
                     for notif in existing_notifs:
                         if notif.get("is_enabled", 1):
                             await notification_cog.toggle_notification(notif["id"], enabled=False, skip_board_update=True)
-                            disabled_count += 1
                             any_disabled = True
                     if any_disabled:
                         event_changes[event_type] = [(None, "disabled")]
@@ -2615,7 +2607,6 @@ class WizardPreviewView(discord.ui.View):
                             bt1_datetime, repeat_minutes, description, embed_data,
                             selected_weekdays=selected_weekdays
                         )
-                        created_count += c
                         updated_count += u
                         if action != "updated":  # Only track non-update changes
                             display = self._get_instance_display_name("Bear Trap", "bt1")
@@ -2630,7 +2621,6 @@ class WizardPreviewView(discord.ui.View):
                             bt2_datetime, repeat_minutes, description, embed_data,
                             selected_weekdays=selected_weekdays
                         )
-                        created_count += c
                         updated_count += u
                         if action != "updated":
                             display = self._get_instance_display_name("Bear Trap", "bt2")
@@ -2649,7 +2639,6 @@ class WizardPreviewView(discord.ui.View):
                             tuesday_hour, tuesday_minute, next_tuesday,
                             repeat_minutes, description, embed_data
                         )
-                        created_count += c
                         updated_count += u
                         if action != "updated":
                             display = self._get_instance_display_name("Viking Vengeance", "tuesday")
@@ -2663,7 +2652,6 @@ class WizardPreviewView(discord.ui.View):
                             thursday_hour, thursday_minute, next_thursday,
                             repeat_minutes, description, embed_data
                         )
-                        created_count += c
                         updated_count += u
                         if action != "updated":
                             display = self._get_instance_display_name("Viking Vengeance", "thursday")
@@ -2682,7 +2670,6 @@ class WizardPreviewView(discord.ui.View):
                             repeat_minutes, description,
                             self._phase_embed(event_name, embed_data, "legion1")
                         )
-                        created_count += c
                         updated_count += u
                         if action != "updated":
                             display = self._get_instance_display_name(event_name, "legion1")
@@ -2690,7 +2677,6 @@ class WizardPreviewView(discord.ui.View):
                     else:
                         # Legion 1 disabled - disable if existed
                         d = await self._disable_instance(notification_cog, event_name, "legion1")
-                        disabled_count += d
                         if d > 0:
                             display = self._get_instance_display_name(event_name, "legion1")
                             event_changes.setdefault(event_name, []).append((display, "disabled"))
@@ -2704,7 +2690,6 @@ class WizardPreviewView(discord.ui.View):
                             repeat_minutes, description,
                             self._phase_embed(event_name, embed_data, "legion2")
                         )
-                        created_count += c
                         updated_count += u
                         if action != "updated":
                             display = self._get_instance_display_name(event_name, "legion2")
@@ -2712,7 +2697,6 @@ class WizardPreviewView(discord.ui.View):
                     else:
                         # Legion 2 disabled - disable if existed
                         d = await self._disable_instance(notification_cog, event_name, "legion2")
-                        disabled_count += d
                         if d > 0:
                             display = self._get_instance_display_name(event_name, "legion2")
                             event_changes.setdefault(event_name, []).append((display, "disabled"))
@@ -2730,14 +2714,12 @@ class WizardPreviewView(discord.ui.View):
                             repeat_minutes, description,
                             self._phase_embed(event_name, embed_data, "legion1")
                         )
-                        created_count += c
                         updated_count += u
                         if action != "updated":
                             display = self._get_instance_display_name(event_name, "legion1")
                             event_changes.setdefault(event_name, []).append((display, action))
                     else:
                         d = await self._disable_instance(notification_cog, event_name, "legion1")
-                        disabled_count += d
                         if d > 0:
                             display = self._get_instance_display_name(event_name, "legion1")
                             event_changes.setdefault(event_name, []).append((display, "disabled"))
@@ -2751,14 +2733,12 @@ class WizardPreviewView(discord.ui.View):
                             repeat_minutes, description,
                             self._phase_embed(event_name, embed_data, "legion2")
                         )
-                        created_count += c
                         updated_count += u
                         if action != "updated":
                             display = self._get_instance_display_name(event_name, "legion2")
                             event_changes.setdefault(event_name, []).append((display, action))
                     else:
                         d = await self._disable_instance(notification_cog, event_name, "legion2")
-                        disabled_count += d
                         if d > 0:
                             display = self._get_instance_display_name(event_name, "legion2")
                             event_changes.setdefault(event_name, []).append((display, "disabled"))
@@ -2786,7 +2766,6 @@ class WizardPreviewView(discord.ui.View):
                                 hour, minute, event_next_occurrence,
                                 repeat_minutes, phase_description, phase_embed
                             )
-                            created_count += c
                             updated_count += u
                             if action != "updated":
                                 # For Fortress Battle, use the time as display name
@@ -2799,7 +2778,6 @@ class WizardPreviewView(discord.ui.View):
                         old_phase = notif.get("instance_identifier") or "default"
                         if old_phase not in processed_phases and notif.get("is_enabled", 1):
                             await notification_cog.toggle_notification(notif["id"], enabled=False, skip_board_update=True)
-                            disabled_count += 1
                             # Get the time from the old notification for display
                             display = self._get_instance_display_name(event_name, old_phase, notif.get("hour"), notif.get("minute"))
                             event_changes.setdefault(event_name, []).append((display, "disabled"))
@@ -2827,7 +2805,6 @@ class WizardPreviewView(discord.ui.View):
                                 hour, minute, event_next_occurrence,
                                 repeat_minutes, phase_description, phase_embed
                             )
-                            created_count += c
                             updated_count += u
                             if action != "updated":
                                 # Eternity's Reach uses times, Castle/KvK use phase names
@@ -2840,7 +2817,6 @@ class WizardPreviewView(discord.ui.View):
                         old_phase = notif.get("instance_identifier") or "default"
                         if old_phase not in processed_phases and notif.get("is_enabled", 1):
                             await notification_cog.toggle_notification(notif["id"], enabled=False, skip_board_update=True)
-                            disabled_count += 1
                             display = self._get_instance_display_name(event_name, old_phase, notif.get("hour"), notif.get("minute"))
                             event_changes.setdefault(event_name, []).append((display, "disabled"))
 
@@ -2864,7 +2840,6 @@ class WizardPreviewView(discord.ui.View):
                                 hour, minute, start_date,
                                 repeat_minutes, description, embed_data
                             )
-                            created_count += c
                             updated_count += u
                             if action != "updated":
                                 display = self._get_instance_display_name(event_name, instance_id)
@@ -2876,7 +2851,6 @@ class WizardPreviewView(discord.ui.View):
                         old_instance = notif.get("instance_identifier") or "default"
                         if old_instance not in processed_instances and notif.get("is_enabled", 1):
                             await notification_cog.toggle_notification(notif["id"], enabled=False, skip_board_update=True)
-                            disabled_count += 1
                             display = self._get_instance_display_name(event_name, old_instance)
                             event_changes.setdefault(event_name, []).append((display, "disabled"))
 
@@ -2886,7 +2860,6 @@ class WizardPreviewView(discord.ui.View):
                         0, 0, event_next_occurrence,
                         24 * 60, description, embed_data
                     )
-                    created_count += c
                     updated_count += u
                     if action != "updated":
                         # Daily Reset uses None as display (single-instance event)
@@ -2969,7 +2942,7 @@ class WizardPreviewView(discord.ui.View):
 
 class WizardCompletionView(discord.ui.View):
     def __init__(self, cog: NotificationWizard, session: WizardSession):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.session = session
 

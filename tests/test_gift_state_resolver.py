@@ -1,4 +1,5 @@
 """State resolver: detect a player's true kid via an invalid-code probe."""
+import pytest
 import asyncio
 import logging
 import sqlite3
@@ -13,6 +14,7 @@ def test_classify_probe():
     assert res.classify_probe(200, {"msg": "SUCCESS", "err_code": 20000}) == "match"
     assert res.classify_probe(200, {"msg": "TOO FREQUENT.", "err_code": 40019}) == "throttle"
     assert res.classify_probe(429, {}) == "throttle"
+    assert res.classify_probe(500, {}) == "throttle"
     assert res.classify_probe(200, {}) == "error"
 
 
@@ -167,14 +169,21 @@ def test_candidate_ordering_alliance_kid_first(monkeypatch):
 
 # --- alliance binding + backfill --------------------------------------------------
 
+class _KeepOpen(sqlite3.Connection):
+    """A shared in-memory connection that survives the code under test closing it."""
+
+    def close(self):
+        pass
+
+
 def _two_dbs(monkeypatch, users_rows, alliance_rows):
-    """In-memory users.sqlite + alliance.sqlite. sqlite3's context manager commits but
-    does NOT close, so the same in-memory conn survives repeated `with connect(...)`."""
-    users = sqlite3.connect(":memory:")
-    users.execute("CREATE TABLE users (fid INTEGER, alliance TEXT, kid INTEGER, state_mismatch_at TEXT)")
+    """In-memory users.sqlite + alliance.sqlite, shared across every connect() call."""
+    users = sqlite3.connect(":memory:", factory=_KeepOpen)
+    users.execute("CREATE TABLE users (fid INTEGER, alliance TEXT, kid INTEGER, state_mismatch_at TEXT, "
+                  "kingdom_scan_next INTEGER, kingdom_scan_done_at TEXT)")
     users.executemany("INSERT INTO users (fid, alliance, kid) VALUES (?, ?, ?)", users_rows)
     users.commit()
-    alliance = sqlite3.connect(":memory:")
+    alliance = sqlite3.connect(":memory:", factory=_KeepOpen)
     alliance.execute("CREATE TABLE alliance_list (alliance_id INTEGER, name TEXT, kid INTEGER, multistate INTEGER DEFAULT 0, state_locked INTEGER DEFAULT 0)")
     alliance.executemany("INSERT INTO alliance_list (alliance_id, name, kid) VALUES (?, ?, ?)", alliance_rows)
     alliance.commit()
@@ -244,23 +253,13 @@ def test_fids_missing_state(monkeypatch):
 
 # --- multistate flag (public/mixed alliances that must never bind to one state) ----
 
-def test_state_lock_is_separate_from_home_state(monkeypatch):
-    _, alliance = _two_dbs(monkeypatch, [], [(5, 'A', 700)])
-    assert res.is_state_locked(5) is False          # kid set, but not locked
-    res.set_state_locked(5, True)
-    assert res.is_state_locked(5) is True
-    assert alliance.execute("SELECT kid FROM alliance_list WHERE alliance_id=5").fetchone()[0] == 700  # home state kept
-    res.set_state_locked(5, False)
-    assert res.is_state_locked(5) is False
-
-
 def test_auto_bind_does_not_lock(monkeypatch):
-    _two_dbs(monkeypatch,
-             [(1, '5', 245), (2, '5', 245), (3, '5', 245)],
-             [(5, 'A', None)])
+    _, alliance = _two_dbs(monkeypatch,
+                           [(1, '5', 245), (2, '5', 245), (3, '5', 245)],
+                           [(5, 'A', None)])
     res.bind_all_alliances()
     assert res.get_alliance_kid(5) == 245           # home state set
-    assert res.is_state_locked(5) is False          # but NOT locked
+    assert alliance.execute("SELECT state_locked FROM alliance_list WHERE alliance_id=5").fetchone()[0] == 0  # but NOT locked
 
 
 def test_set_and_read_multistate(monkeypatch):
@@ -325,3 +324,69 @@ def test_assign_skips_multistate_members(monkeypatch):
     assert res.assign_alliance_kid_to_missing() == [1]   # only alliance 5's member
     kids = dict(users.execute("SELECT fid, kid FROM users").fetchall())
     assert kids == {1: 700, 2: None}
+
+
+# --- range phase, resume point, idle gate ----------------------------------------------
+
+
+def _range_run(monkeypatch, true_kid, **kw):
+    probed = []
+
+    async def probe(cog, session, fid, kid, code):
+        probed.append(kid)
+        return "match" if kid == true_kid else "nomatch"
+
+    async def no_sleep(_s):
+        return None
+
+    _patch(monkeypatch, [10], probe)
+    monkeypatch.setattr(res.asyncio, "sleep", no_sleep)
+    return asyncio.run(res.resolve_state(_cog(), 1, **kw)), probed
+
+
+def test_range_phase_runs_after_likely(monkeypatch):
+    result, probed = _range_run(monkeypatch, 7, scan_range=(5, 9))
+    assert result == 7
+    assert probed == [10, 5, 6, 7]
+
+
+def test_range_phase_skips_kingdoms_already_tried(monkeypatch):
+    result, probed = _range_run(monkeypatch, None, scan_range=(9, 11))
+    assert probed == [10, 9, 11]
+
+
+def test_start_at_skips_earlier_range_but_tries_likely_outside_it(monkeypatch):
+    result, probed = _range_run(monkeypatch, 8, scan_range=(5, 9), start_at=8)
+    assert probed == [10, 8] and result == 8
+
+
+def test_full_sweep_without_match_returns_none(monkeypatch):
+    result, probed = _range_run(monkeypatch, None, scan_range=(1, 3))
+    assert result is None and probed == [10, 1, 2, 3]
+
+
+def test_checkpoint_saved_when_interrupted_mid_range(monkeypatch):
+    saved = []
+    calls = {"n": 0}
+
+    async def gate():
+        calls["n"] += 1
+        if calls["n"] == 4:                       # likely 10, range 5, 6, then stop before 7
+            raise res.StateResolveInterrupted(1)
+
+    async def checkpoint(next_kid):
+        saved.append(next_kid)
+
+    with pytest.raises(res.StateResolveInterrupted):
+        _range_run(monkeypatch, None, scan_range=(5, 9), wait_until_idle=gate, on_checkpoint=checkpoint)
+    assert saved[0] == 5 and saved[-1] == 7       # range start saved, resumes exactly at 7
+
+
+def test_no_checkpoint_after_match(monkeypatch):
+    saved = []
+
+    async def checkpoint(next_kid):
+        saved.append(next_kid)
+
+    _range_run(monkeypatch, 6, scan_range=(5, 9), on_checkpoint=checkpoint)
+    assert saved == [5]                           # only the range-start save; nothing left to resume

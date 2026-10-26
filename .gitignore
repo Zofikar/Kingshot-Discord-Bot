@@ -31,3 +31,4 @@
 # otherwise pull __pycache__/*.pyc into version control.
 __pycache__/
 *.pyc
+tests/sim/gallery/

@@ -3,7 +3,6 @@ Alliance member operations. Handles member imports, removals, and transfers.
 """
 import discord
 from discord.ext import commands
-from discord import app_commands
 import sqlite3
 import asyncio
 import time
@@ -15,14 +14,14 @@ import csv
 import io
 from contextlib import closing
 from .permission_handler import PermissionManager
-from .pimp_my_bot import theme, safe_edit_message, disable_expired_view
+from .pimp_my_bot import theme, safe_edit_message, menu_timeout, confirm_timeout, plural
 from .process_queue import MEMBER_ADD, PreemptedException
 from .bot_level_mapping import LEVEL_MAPPING, parse_furnace_level
 from .alliance import resolve_alliance_kid, kingdom_lock_reason, KINGDOM_CHECK_UNAVAILABLE
-from .gift_state_resolver import verify_add_state
+from .alliance_api_sync import api_available_async, look_up_new_member, store_new_member
 from .alliance_member_edit import (
     BulkMemberEditModal, MemberEditModal, apply_edit_lines, build_prefill,
-    edit_result_embed, enqueue_catchups, is_placeholder_name, new_member_name, parse_power,
+    edit_result_embed, enqueue_catchups, is_placeholder_name, parse_power,
 )
 from . import alliance_power_changes
 
@@ -33,12 +32,71 @@ _NAME_HEADERS = {"name", "nickname", "player name", "player_name"}
 _LEVEL_HEADERS = {"tc_level", "tc level", "fc_level", "fc level", "furnace", "furnace_lv", "level"}
 _STATE_HEADERS = {"state", "kid", "kingdom", "home state"}
 _POWER_HEADERS = {"power"}
+_NO_PROFILE = ("", "", "", "", "")
 _COMBAT_POWER_HEADERS = {"combat power", "combat_power", "cp"}
 
 
 def _power_cell(value: str) -> str:
     """Normalize to plain digits so the value survives the comma-separated edit line."""
     return str(parse_power(value) or value.replace(",", ""))
+
+
+def _join_names(names, limit: int = 1000) -> str:
+    names = [str(n) for n in names]
+    shown, length = [], 0
+    for i, name in enumerate(names):
+        length += len(name) + (2 if shown else 0)
+        if length > limit:
+            return ", ".join(shown) + f" …and {len(names) - i} more"
+        shown.append(name)
+    return ", ".join(shown) or "-"
+
+
+# -> (ok, locked_kid, allowed_fids, skipped_names); ok=False means the lock could not be read.
+def _split_by_state_lock(alliance_id, fids):
+    ok, locked_kid = resolve_alliance_kid(alliance_id)
+    if not ok:
+        return False, None, [], []
+    if locked_kid is None or not fids:
+        return True, locked_kid, list(fids), []
+    placeholders = ",".join("?" * len(fids))
+    with closing(sqlite3.connect('db/users.sqlite', timeout=30.0)) as users_db:
+        rows = users_db.execute(
+            f"SELECT fid, nickname, kid FROM users WHERE fid IN ({placeholders})", list(fids)
+        ).fetchall()
+    by_fid = {str(fid): (nick, kid) for fid, nick, kid in rows}
+    allowed, skipped = [], []
+    for fid in fids:
+        nick, kid = by_fid.get(str(fid), (None, None))
+        if kingdom_lock_reason(locked_kid, kid) is None:
+            allowed.append(fid)
+        else:
+            skipped.append(nick or str(fid))
+    return True, locked_kid, allowed, skipped
+
+
+def _state_skip_line(target_name, locked_kid, skipped) -> str:
+    return (
+        f"Skipped **{len(skipped)}** {plural(len(skipped), 'member')} from another kingdom, "
+        f"because **{target_name}** only accepts Kingdom #{locked_kid}: {_join_names(skipped, 500)}"
+    )
+
+
+def _no_members_moved_embed(lock_ok, target_name, locked_kid, skipped) -> discord.Embed:
+    return discord.Embed(
+        title=f"{theme.deniedIcon} No Members Moved",
+        description=(KINGDOM_CHECK_UNAVAILABLE if not lock_ok
+                     else _state_skip_line(target_name, locked_kid, skipped)),
+        color=theme.emColor2,
+    )
+
+
+# Public messages get a bot-token handle, since the interaction token dies after 15 minutes.
+def _bot_editable_message(interaction: discord.Interaction, message):
+    channel = interaction.channel
+    if message.flags.ephemeral or channel is None or not hasattr(channel, "get_partial_message"):
+        return message
+    return channel.get_partial_message(message.id)
 
 
 def _extract_profiles_from_csv(text: str) -> dict:
@@ -98,6 +156,37 @@ def _extract_ids_from_csv(text: str) -> list[str]:
             seen.add(v)
             out.append(v)
     return out
+
+
+def _ids_from_table(ids: str) -> list[str]:
+    """IDs from pasted CSV/TSV: the id/fid column, or the first column when there's no header."""
+    lines = [line.strip() for line in ids.split('\n') if line.strip()]
+    if not lines or not any(delimiter in lines[0] for delimiter in [',', '\t']):
+        return []
+    delimiter = '\t' if '\t' in lines[0] else ','
+    try:
+        rows = list(csv.reader(io.StringIO(ids), delimiter=delimiter))
+    except Exception:
+        return []
+    if len(rows) <= 1:
+        return []
+    headers = [h.strip().lower() for h in rows[0]]
+    id_col = next((i for i, h in enumerate(headers) if h in ['id', 'fid']), None)
+    if id_col is None:
+        if not (rows[0] and rows[0][0].strip().isdigit()):
+            return []
+        id_col, rows = 0, [[]] + rows
+    cells = (row[id_col] for row in rows[1:] if len(row) > id_col and row[id_col].strip())
+    return [fid for fid in (''.join(c for c in cell if c.isdigit()) for cell in cells) if fid]
+
+
+def parse_member_ids(ids: str) -> list[str]:
+    """IDs from the add-members box (table, one per line, or comma-separated), duplicates dropped."""
+    ids_list = _ids_from_table(ids)
+    if not ids_list:
+        separator = '\n' if '\n' in ids else ','
+        ids_list = [fid.strip() for fid in ids.split(separator) if fid.strip()]
+    return list(dict.fromkeys(ids_list))
 
 
 class _MemberAddProgress:
@@ -205,18 +294,19 @@ class MemberFilterModal(discord.ui.Modal):
 class MemberListView(discord.ui.View):
     # Subclasses that offer Edit/Bulk Edit flip this so the embed can point at them.
     CAN_EDIT = False
+    sync_ready = False  # set by the opener from api_available_async(); adds Player Sync to the hints
     PAGE_SIZE = 20
     SORTS = [
-        ("FC \u2193",      lambda m: (-m['furnace_lv'], m['nickname'].casefold()), False),
-        ("FC \u2191",      lambda m: (m['furnace_lv'], m['nickname'].casefold()),  False),
+        ("TC \u2193",      lambda m: (-m['furnace_lv'], m['nickname'].casefold()), False),
+        ("TC \u2191",      lambda m: (m['furnace_lv'], m['nickname'].casefold()),  False),
         ("Name A→Z",  lambda m: m['nickname'].casefold(),                      False),
         ("Name Z→A",  lambda m: m['nickname'].casefold(),                      True),
         ("ID \u2191",      lambda m: m['fid'],                                       False),
-        ("State \u2191",   lambda m: (m['kid'] is None, m['kid'] or 0, -m['furnace_lv']), False),
+        ("Kingdom \u2191", lambda m: (m['kid'] is None, m['kid'] or 0, -m['furnace_lv']), False),
     ]
 
     def __init__(self, members, alliance_id, alliance_name, cog, author_id):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.all_members = [
             {'fid': fid, 'nickname': nick or '', 'furnace_lv': fl or 0, 'kid': kid}
             for fid, nick, fl, kid in members
@@ -357,11 +447,15 @@ class MemberListView(discord.ui.View):
         ]
         if any(m.get('power') is not None or m.get('combat_power') is not None
                for m in self.all_members):
-            header.append(f"{theme.infoIcon} **PWR / CPWR:** Power and Combat Power, "
-                          "from screenshot uploads or Edit")
+            sources = ("from screenshot uploads, Edit or Player Sync" if self.sync_ready
+                       else "from screenshot uploads or Edit")
+            header.append(f"{theme.infoIcon} **PWR / CPWR:** Power and Combat Power, {sources}")
         unnamed_count = len(self._unnamed())
         if unnamed_count:
-            hint = "  ·  select one and press Edit, or use Bulk Edit" if self.CAN_EDIT else ""
+            hint = ""
+            if self.CAN_EDIT:
+                hint = ("  ·  select one and press Edit, use Bulk Edit, or let Player Sync fill them in"
+                        if self.sync_ready else "  ·  select one and press Edit, or use Bulk Edit")
             header.append(f"{theme.warnIcon} **Still unnamed:** `{unnamed_count}`{hint}")
         if self._has_filter():
             parts = []
@@ -536,9 +630,6 @@ class MemberListView(discord.ui.View):
         await interaction.response.send_message(
             embed=column_embed, view=column_view, ephemeral=True
         )
-
-    async def on_timeout(self) -> None:
-        await disable_expired_view(self)
 
 
 class ManageMembersView(MemberListView):
@@ -916,7 +1007,7 @@ class ManageMembersView(MemberListView):
             placeholder=f"{theme.pinIcon} Choose the target alliance…",
             options=target_options,
         )
-        target_view = discord.ui.View(timeout=300)
+        target_view = discord.ui.View(timeout=menu_timeout())
         target_view.add_item(target_select)
 
         parent_view = self
@@ -931,6 +1022,12 @@ class ManageMembersView(MemberListView):
                         (target_alliance_id,),
                     )
                     target_name = cur.fetchone()[0]
+                lock_ok, locked_kid, fids, skipped = await asyncio.to_thread(
+                    _split_by_state_lock, target_alliance_id, fids)
+                if not lock_ok or not fids:
+                    await target_interaction.response.edit_message(
+                        embed=_no_members_moved_embed(lock_ok, target_name, locked_kid, skipped), view=None)
+                    return
                 with sqlite3.connect('db/users.sqlite') as users_db:
                     cur = users_db.cursor()
                     placeholders = ",".join("?" * len(fids))
@@ -975,8 +1072,8 @@ class ManageMembersView(MemberListView):
                         description=(
                             f"Moved **{len(fids)}** member(s) from "
                             f"**{parent_view.alliance_name}** to **{target_name}**.\n\n"
-                            f"_The Manage Members list behind this dialog has been "
-                            f"refreshed._"
+                            + (f"{_state_skip_line(target_name, locked_kid, skipped)}\n\n" if skipped else "")
+                            + "_The Manage Members list behind this dialog has been refreshed._"
                         ),
                         color=theme.emColor3,
                     ),
@@ -1065,7 +1162,7 @@ class _RemoveSelectedConfirmView(discord.ui.View):
     """Yes/no confirmation for ManageMembersView's Remove Selected action."""
 
     def __init__(self, parent_view: ManageMembersView):
-        super().__init__(timeout=60)
+        super().__init__(timeout=confirm_timeout())
         self.parent_view = parent_view
 
     @discord.ui.button(label="Confirm Remove", emoji=theme.minusIcon,
@@ -1198,7 +1295,7 @@ class AllianceMemberOperations(commands.Cog):
             interaction, embed=view.build_embed(), view=view, content=None,
         )
         try:
-            view.message = await interaction.original_response()
+            view.message = _bot_editable_message(interaction, await interaction.original_response())
         except discord.HTTPException:
             pass
 
@@ -1241,11 +1338,12 @@ class AllianceMemberOperations(commands.Cog):
             members, alliance_id, alliance_name, self,
             interaction.user.id, alliances=alliances_with_counts,
         )
+        view.sync_ready = await api_available_async()
         await safe_edit_message(
             interaction, embed=view.build_embed(), view=view, content=None,
         )
         try:
-            view.message = await interaction.original_response()
+            view.message = _bot_editable_message(interaction, await interaction.original_response())
         except Exception:
             pass
 
@@ -1478,13 +1576,20 @@ class AllianceMemberOperations(commands.Cog):
                             ) for alliance_id, name, count in alliances_with_counts
                             if alliance_id != source_alliance_id
                         ]
+                        if not target_options:
+                            no_target_msg = f"{theme.deniedIcon} There is no other alliance to transfer these members to."
+                            if member_interaction.response.is_done():
+                                await member_interaction.followup.send(no_target_msg, ephemeral=True)
+                            else:
+                                await member_interaction.response.send_message(no_target_msg, ephemeral=True)
+                            return
 
                         target_select = discord.ui.Select(
                             placeholder=f"{theme.pinIcon} Select target alliance...",
                             options=target_options
                         )
 
-                        target_view = discord.ui.View()
+                        target_view = discord.ui.View(timeout=menu_timeout())
                         target_view.add_item(target_select)
 
                         async def target_callback(target_interaction: discord.Interaction):
@@ -1496,22 +1601,42 @@ class AllianceMemberOperations(commands.Cog):
                                     cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (target_alliance_id,))
                                     target_alliance_name = cursor.fetchone()[0]
 
+                                lock_ok, locked_kid, moved_fids, skipped = await asyncio.to_thread(
+                                    _split_by_state_lock, target_alliance_id, selected_fids
+                                )
+                                if not lock_ok or not moved_fids:
+                                    await target_interaction.response.edit_message(
+                                        embed=_no_members_moved_embed(
+                                            lock_ok, target_alliance_name, locked_kid, skipped),
+                                        view=None
+                                    )
+                                    return
+
                                 with sqlite3.connect('db/users.sqlite') as users_db:
                                     cursor = users_db.cursor()
-                                    placeholders = ','.join('?' * len(selected_fids))
+                                    placeholders = ','.join('?' * len(moved_fids))
                                     cursor.execute(
                                         f"UPDATE users SET alliance = ? WHERE fid IN ({placeholders})",
-                                        [target_alliance_id] + selected_fids
+                                        [target_alliance_id] + moved_fids
                                     )
                                     users_db.commit()
 
+                                moved = {str(f) for f in moved_fids}
+                                moved_list = "\n".join(
+                                    f"• {nickname} (ID: {fid})"
+                                    for fid, nickname in [m for m in selected_members if str(m[0]) in moved][:10]
+                                )
+                                if len(moved_fids) > 10:
+                                    moved_list += f"\n... and {len(moved_fids) - 10} more"
+                                skip_text = (f"\n\n{_state_skip_line(target_alliance_name, locked_kid, skipped)}"
+                                             if skipped else "")
                                 success_embed = discord.Embed(
                                     title=f"{theme.verifiedIcon} Transfer Successful",
                                     description=(
-                                        f"**Members Transferred:** {len(selected_fids)}\n"
+                                        f"**Members Transferred:** {len(moved_fids)}\n"
                                         f"{theme.allianceOldIcon} **Source:** {source_alliance_name}\n"
                                         f"{theme.allianceIcon} **Target:** {target_alliance_name}\n\n"
-                                        f"**Transferred Members:**\n{member_list}"
+                                        f"**Transferred Members:**\n{moved_list}{skip_text}"
                                     ),
                                     color=theme.emColor3
                                 )
@@ -1522,7 +1647,7 @@ class AllianceMemberOperations(commands.Cog):
                                 )
 
                                 logger.info(
-                                    f"Bulk transfer: {len(selected_fids)} members from {source_alliance_name} to {target_alliance_name}"
+                                    f"Bulk transfer: {len(moved_fids)} members from {source_alliance_name} to {target_alliance_name}"
                                 )
 
                             except Exception as e:
@@ -1705,62 +1830,39 @@ class AllianceMemberOperations(commands.Cog):
         except Exception:
             pass  # non-fatal — the operation still runs
 
+    def _insert_member(self, fid, nickname, furnace_lv, kid, alliance_id, power, combat_power):
+        # Roll back on failure: this connection lives as long as the cog and would hold the lock.
+        now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        try:
+            self.c_users.execute("""
+                INSERT INTO users (fid, nickname, furnace_lv, kid, stove_lv_content, alliance,
+                                   power, power_updated_at, combat_power, combat_power_updated_at)
+                VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
+            """, (fid, nickname, furnace_lv, kid, alliance_id,
+                  power, now_iso if power else None,
+                  combat_power, now_iso if combat_power else None))
+            self.conn_users.commit()
+        except sqlite3.Error:
+            self.conn_users.rollback()
+            raise
+
+    async def _resolve_new_member(self, fid, alliance_id, kid_ok, locked_kid, profile):
+        """(NewMember, denial reason or None): the API's state when it has one, else one probe."""
+        csv_name, csv_level, *_ = profile or _NO_PROFILE
+        member = await look_up_new_member(self.bot, fid, alliance_id, csv_name, parse_furnace_level(csv_level))
+        if not kid_ok:
+            return member, KINGDOM_CHECK_UNAVAILABLE
+        if locked_kid is not None and not member.verified:
+            return member, kingdom_lock_reason(locked_kid, member.kid)
+        return member, None
+
     async def _process_add_user(self, message: Optional[discord.Message], alliance_id: str, alliance_name: str,
                                 ids: str, invoker_id: Optional[int], invoker_name: str,
                                 process_id: Optional[int] = None,
                                 resumed_state: Optional[dict] = None,
                                 profiles: Optional[dict] = None):
         progress = _MemberAddProgress(message)
-        ids_list = []
-        
-        # Check if this is CSV/TSV data with headers
-        lines = [line.strip() for line in ids.split('\n') if line.strip()]
-        if lines and any(delimiter in lines[0] for delimiter in [',', '\t']):
-            # Detect delimiter
-            delimiter = '\t' if '\t' in lines[0] else ','
-            
-            # Try to parse as CSV/TSV
-            try:
-                reader = csv.reader(io.StringIO(ids), delimiter=delimiter)
-                rows = list(reader)
-                
-                if rows and len(rows) > 1:
-                    # Get headers
-                    headers = [h.strip().lower() for h in rows[0]]
-                    
-                    # Find ID column - look for 'id', 'fid'
-                    id_col_index = None
-                    for i, header in enumerate(headers):
-                        if header in ['id', 'fid']:
-                            id_col_index = i
-                            break
-                    
-                    if id_col_index is not None:
-                        # Extract IDs from data rows
-                        for row in rows[1:]:
-                            if len(row) > id_col_index and row[id_col_index].strip():
-                                # Clean the ID
-                                fid = ''.join(c for c in row[id_col_index] if c.isdigit())
-                                if fid:
-                                    ids_list.append(fid)
-                        
-                    else:
-                        # No header found, treat first row as data if it looks like IDs
-                        if rows[0] and rows[0][0].strip().isdigit():
-                            for row in rows:
-                                if row and row[0].strip():
-                                    fid = ''.join(c for c in row[0] if c.isdigit())
-                                    if fid:
-                                        ids_list.append(fid)
-            except Exception:
-                pass  # Fall back to simple parsing
-        
-        # If CSV/TSV parsing didn't work or wasn't applicable, use simple parsing
-        if not ids_list:
-            if '\n' in ids:
-                ids_list = [fid.strip() for fid in ids.split('\n') if fid.strip()]
-            else:
-                ids_list = [fid.strip() for fid in ids.split(",") if fid.strip()]
+        ids_list = parse_member_ids(ids)
 
         # Pre-check which IDs already exist in the database
         already_in_db = []
@@ -1849,24 +1951,21 @@ class AllianceMemberOperations(commands.Cog):
                 embed.set_field_at(
                     0,
                     name=f"{theme.verifiedIcon} Successfully Added ({added_count}/{total_users})",
-                    value="User list cannot be displayed due to exceeding 70 users" if len(added_users) > 70
-                    else ", ".join([n for _, n in added_users]) or "-",
+                    value=_join_names([n for _, n in added_users]),
                     inline=False
                 )
             if error_count > 0:
                 embed.set_field_at(
                     1,
                     name=f"{theme.deniedIcon} Failed ({error_count}/{total_users})",
-                    value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70
-                    else ", ".join(error_users) or "-",
+                    value=_join_names(error_users),
                     inline=False
                 )
             if already_exists_count > 0:
                 embed.set_field_at(
                     2,
                     name=f"{theme.warnIcon} Already Exists ({already_exists_count}/{total_users})",
-                    value="Existing user list cannot be displayed due to exceeding 70 users" if len(already_exists_users) > 70
-                    else ", ".join([n for _, n in already_exists_users]) or "-",
+                    value=_join_names([n for _, n in already_exists_users]),
                     inline=False
                 )
             if added_count > 0 or error_count > 0 or already_exists_count > 0:
@@ -1880,12 +1979,16 @@ class AllianceMemberOperations(commands.Cog):
 
             index = 0
             while index < len(fids_to_process):
+                if process_queue_cog and process_queue_cog.stop_requested():
+                    logger.info(f"AllianceMemberOps: member add for {alliance_name} stopped by an admin")
+                    break
                 # Check for higher-priority work
                 if process_queue_cog and process_queue_cog.should_preempt():
                     logger.info(f"AllianceMemberOps: Preempting member add for {alliance_name} - higher priority work waiting")
                     self._checkpoint_member_add_state(
                         process_queue_cog, process_id, alliance_id, alliance_name,
                         ids, invoker_id, invoker_name, added_users, error_users,
+                        profiles=profiles,
                     )
                     raise PreemptedException()
 
@@ -1898,19 +2001,9 @@ class AllianceMemberOperations(commands.Cog):
                     embed.description = f"Processing {total_users} members...\n{rate_text}{queue_info}\n\n**Progress:** `{current_progress}/{total_users}`"
                     await progress.edit(embed)
                     
-                    # Determine the member's state
-                    gift_cog = self.bot.get_cog("GiftOperations")
-                    if gift_cog is not None:
-                        kid, verified = await verify_add_state(gift_cog, fid, alliance_id)
-                    else:
-                        kid, verified = None, False
-
-                    if not kid_ok:
-                        state_error = KINGDOM_CHECK_UNAVAILABLE
-                    elif locked_kid is not None and not verified:
-                        state_error = kingdom_lock_reason(locked_kid, kid)
-                    else:
-                        state_error = None
+                    profile = (profiles or {}).get(str(fid))
+                    member, state_error = await self._resolve_new_member(
+                        fid, alliance_id, kid_ok, locked_kid, profile)
 
                     if state_error:
                         with open(log_file_path, 'a', encoding='utf-8') as log_file:
@@ -1920,8 +2013,7 @@ class AllianceMemberOperations(commands.Cog):
                         embed.set_field_at(
                             1,
                             name=f"{theme.deniedIcon} Failed ({error_count}/{total_users})",
-                            value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70
-                            else ", ".join(error_users) or "-",
+                            value=_join_names(error_users),
                             inline=False
                         )
                         await progress.edit(embed)
@@ -1930,22 +2022,13 @@ class AllianceMemberOperations(commands.Cog):
 
                     # Kingdom comes from the add-path check above so locks still apply;
                     # CSV state only updates existing members.
-                    csv_name, csv_level, _csv_state, csv_power, csv_combat_power = \
-                        (profiles or {}).get(str(fid), ("", "", "", "", ""))
-                    nickname = new_member_name(csv_name, fid)
-                    furnace_lv = parse_furnace_level(csv_level) or 0
-                    power = parse_power(csv_power)
+                    *_, csv_power, csv_combat_power = profile or _NO_PROFILE
+                    nickname, kid = member.nickname, member.kid
+                    power = member.power or parse_power(csv_power)
                     combat_power = parse_power(csv_combat_power)
-                    now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
                     try:  # Pre-filtered, so this ID should not already exist.
-                        self.c_users.execute("""
-                            INSERT INTO users (fid, nickname, furnace_lv, kid, stove_lv_content, alliance,
-                                               power, power_updated_at, combat_power, combat_power_updated_at)
-                            VALUES (?, ?, ?, ?, NULL, ?, ?, ?, ?, ?)
-                        """, (fid, nickname, furnace_lv, kid, alliance_id,
-                              power, now_iso if power else None,
-                              combat_power, now_iso if combat_power else None))
-                        self.conn_users.commit()
+                        self._insert_member(fid, nickname, member.furnace_lv, kid, alliance_id, power, combat_power)
+                        await store_new_member(member, fid)
 
                         with open(self.log_file, 'a', encoding='utf-8') as f:
                             f.write(f"[{timestamp}] Successfully added member - ID: {fid}, Kingdom: {kid}\n")
@@ -1955,8 +2038,7 @@ class AllianceMemberOperations(commands.Cog):
                         embed.set_field_at(
                             0,
                             name=f"{theme.verifiedIcon} Successfully Added ({added_count}/{total_users})",
-                            value="User list cannot be displayed due to exceeding 70 users" if len(added_users) > 70
-                            else ", ".join([n for _, n in added_users]) or "-",
+                            value=_join_names([n for _, n in added_users]),
                             inline=False
                         )
                         await progress.edit(embed)
@@ -1969,8 +2051,7 @@ class AllianceMemberOperations(commands.Cog):
                         embed.set_field_at(
                             2,
                             name=f"{theme.warnIcon} Already Exists ({already_exists_count}/{total_users})",
-                            value="Existing user list cannot be displayed due to exceeding 70 users" if len(already_exists_users) > 70
-                            else ", ".join([n for _, n in already_exists_users]) or "-",
+                            value=_join_names([n for _, n in already_exists_users]),
                             inline=False
                         )
                         await progress.edit(embed)
@@ -1983,8 +2064,7 @@ class AllianceMemberOperations(commands.Cog):
                         embed.set_field_at(
                             1,
                             name=f"{theme.deniedIcon} Failed ({error_count}/{total_users})",
-                            value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70
-                            else ", ".join(error_users) or "-",
+                            value=_join_names(error_users),
                             inline=False
                         )
                         await progress.edit(embed)
@@ -2009,20 +2089,17 @@ class AllianceMemberOperations(commands.Cog):
                                 f"in alliance {alliance_id}")
 
             embed.set_field_at(0, name=f"{theme.verifiedIcon} Successfully Added ({added_count}/{total_users})",
-                value="User list cannot be displayed due to exceeding 70 users" if len(added_users) > 70
-                else ", ".join([nickname for _, nickname in added_users]) or "-",
+                value=_join_names([nickname for _, nickname in added_users]),
                 inline=False
             )
             
             embed.set_field_at(1, name=f"{theme.deniedIcon} Failed ({error_count}/{total_users})",
-                value="Error list cannot be displayed due to exceeding 70 users" if len(error_users) > 70 
-                else ", ".join(error_users) or "-",
+                value=_join_names(error_users),
                 inline=False
             )
             
             embed.set_field_at(2, name=f"{theme.warnIcon} Already Exists ({already_exists_count}/{total_users})",
-                value="Existing user list cannot be displayed due to exceeding 70 users" if len(already_exists_users) > 70 
-                else ", ".join([nickname for _, nickname in already_exists_users]) or "-",
+                value=_join_names([nickname for _, nickname in already_exists_users]),
                 inline=False
             )
 
@@ -2111,7 +2188,8 @@ class AllianceMemberOperations(commands.Cog):
     def _checkpoint_member_add_state(self, process_queue_cog, process_id: Optional[int],
                                      alliance_id: str, alliance_name: str, ids: str,
                                      invoker_id: Optional[int], invoker_name: str,
-                                     added_users: list, error_users: list):
+                                     added_users: list, error_users: list,
+                                     profiles: Optional[dict] = None):
         if process_queue_cog is None or process_id is None:
             return
         try:
@@ -2121,6 +2199,7 @@ class AllianceMemberOperations(commands.Cog):
                 'ids': ids,
                 'invoker_id': invoker_id,
                 'invoker_name': invoker_name,
+                'profiles': profiles or {},
                 'resumed_state': {
                     'added_fids': [fid for (fid, _) in added_users],
                     'error_fids': list(error_users),
@@ -2153,14 +2232,25 @@ class AllianceMemberOperations(commands.Cog):
         is_admin, _ = PermissionManager.is_admin(user_id)
         return is_admin
 
-    @commands.Cog.listener()
-    async def on_ready(self):
+    def register_queue_handlers(self, process_queue_cog):
+        process_queue_cog.register_handler('member_add', self.handle_member_add_process)
+        logger.info("AllianceMemberOps: Registered member_add handler with ProcessQueue")
+
+    def _register_with_queue(self):
         process_queue_cog = self.bot.get_cog('ProcessQueue')
         if process_queue_cog:
-            process_queue_cog.register_handler('member_add', self.handle_member_add_process)
-            logger.info("AllianceMemberOps: Registered member_add handler with ProcessQueue")
+            self.register_queue_handlers(process_queue_cog)
         else:
             logger.error("AllianceMemberOps: ProcessQueue cog not found, member_add operations will not work")
+
+    async def cog_load(self):
+        # A reload never re-fires on_ready, so re-register here when already connected.
+        if self.bot.is_ready():
+            self._register_with_queue()
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        self._register_with_queue()
 
     async def cog_unload(self):
         self.conn_users.close()
@@ -2313,8 +2403,8 @@ class AllianceMemberOperations(commands.Cog):
                         dm_embed.add_field(
                             name=f"{theme.chartIcon} Statistics",
                             value=(
-                                f"**Highest FC:** {self.level_mapping.get(max_fc, str(max_fc))}\n"
-                                f"**Average FC:** {self.level_mapping.get(int(avg_fc), str(int(avg_fc)))}"
+                                f"**Highest TC:** {self.level_mapping.get(max_fc, str(max_fc))}\n"
+                                f"**Average TC:** {self.level_mapping.get(int(avg_fc), str(int(avg_fc)))}"
                             ),
                             inline=False
                         )
@@ -2355,30 +2445,6 @@ class AllianceMemberOperations(commands.Cog):
             else:
                 await interaction.response.send_message(embed=error_embed, ephemeral=True)
 
-    async def back_to_alliance_management(self, interaction: discord.Interaction):
-        """Navigate back to the Alliances menu."""
-        try:
-            main_menu_cog = self.bot.get_cog("MainMenu")
-            if main_menu_cog:
-                await main_menu_cog.show_alliance_management(interaction)
-            else:
-                await interaction.response.send_message(
-                    f"{theme.deniedIcon} An error occurred while returning to menu.",
-                    ephemeral=True
-                )
-        except Exception as e:
-            logger.error(f"Menu navigation error in member operations: {e}")
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    f"{theme.deniedIcon} An error occurred while returning to menu.",
-                    ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    f"{theme.deniedIcon} An error occurred while returning to menu.",
-                    ephemeral=True
-                )
-
 class AddMemberModal(discord.ui.Modal):
     def __init__(self, alliance_id):
         super().__init__(title="Add Member")
@@ -2407,7 +2473,7 @@ class AddMemberModal(discord.ui.Modal):
 
 class AllianceSelectView(discord.ui.View):
     def __init__(self, alliances_with_counts, cog=None, page=0, context="transfer", extra_options=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.alliances = alliances_with_counts
         self.cog = cog
         self.page = page
@@ -2418,7 +2484,6 @@ class AllianceSelectView(discord.ui.View):
         self.max_page = (len(alliances_with_counts) - 1) // self.page_size if alliances_with_counts else 0
         self.current_select = None
         self.callback = None
-        self.member_dict = {}
         self.selected_alliance_id = None
         self.context = context  # "transfer", "furnace_history", or "nickname_history"
         self.update_select_menu()
@@ -2576,6 +2641,14 @@ class IDSearchModal(discord.ui.Modal):
                     row = cursor.fetchone()
                     current_alliance_name = row[0] if row else "Unknown"
 
+                has_permission = any(str(aid) == str(current_alliance_id) for aid, _, _ in self.alliances)
+                if not has_permission:
+                    await interaction.response.send_message(
+                        f"{theme.deniedIcon} You don't have permission to manage the alliance this member belongs to.",
+                        ephemeral=True
+                    )
+                    return
+
                 # Handle remove context
                 if self.context == "remove":
                     embed = discord.Embed(
@@ -2591,7 +2664,7 @@ class IDSearchModal(discord.ui.Modal):
                         color=theme.emColor2
                     )
 
-                    view = discord.ui.View()
+                    view = discord.ui.View(timeout=confirm_timeout())
                     confirm_button = discord.ui.Button(
                         label=f"{theme.verifiedIcon} Confirm Delete",
                         style=discord.ButtonStyle.danger
@@ -2661,17 +2734,8 @@ class IDSearchModal(discord.ui.Modal):
                     )
                     return
 
-                # Handle giftcode context - validate permission and invoke callback with alliance
+                # Handle giftcode context - invoke callback with alliance
                 if self.context == "giftcode":
-                    # Check if user has permission to manage this alliance
-                    has_permission = any(str(aid) == str(current_alliance_id) for aid, _, _ in self.alliances)
-                    if not has_permission:
-                        await interaction.response.send_message(
-                            f"{theme.deniedIcon} You don't have permission to manage the alliance this member belongs to.",
-                            ephemeral=True
-                        )
-                        return
-
                     # Invoke callback with the alliance ID
                     if self.callback:
                         await self.callback(interaction, alliance_id=current_alliance_id)
@@ -2692,20 +2756,28 @@ class IDSearchModal(discord.ui.Modal):
                     color=theme.emColor1
                 )
 
+                target_options = [
+                    discord.SelectOption(
+                        label=f"{name[:50]}",
+                        value=str(alliance_id),
+                        description=f"ID: {alliance_id}",
+                        emoji=theme.allianceIcon
+                    ) for alliance_id, name, _ in self.alliances
+                    if str(alliance_id) != str(current_alliance_id)
+                ]
+                if not target_options:
+                    await interaction.response.send_message(
+                        f"{theme.deniedIcon} There is no other alliance to transfer this member to.",
+                        ephemeral=True
+                    )
+                    return
+
                 select = discord.ui.Select(
                     placeholder=f"{theme.pinIcon} Choose the target alliance...",
-                    options=[
-                        discord.SelectOption(
-                            label=f"{name[:50]}",
-                            value=str(alliance_id),
-                            description=f"ID: {alliance_id}",
-                            emoji=theme.allianceIcon
-                        ) for alliance_id, name, _ in self.alliances
-                        if str(alliance_id) != str(current_alliance_id)
-                    ]
+                    options=target_options
                 )
 
-                view = discord.ui.View()
+                view = discord.ui.View(timeout=menu_timeout())
                 view.add_item(select)
 
                 async def select_callback(select_interaction: discord.Interaction):
@@ -2717,6 +2789,20 @@ class IDSearchModal(discord.ui.Modal):
                             cursor.execute("SELECT name FROM alliance_list WHERE alliance_id = ?", (target_alliance_id,))
                             target_alliance_name = cursor.fetchone()[0]
 
+                        lock_ok, locked_kid, allowed, _ = await asyncio.to_thread(
+                            _split_by_state_lock, target_alliance_id, [fid])
+                        if not lock_ok or not allowed:
+                            await select_interaction.response.edit_message(
+                                embed=discord.Embed(
+                                    title=f"{theme.deniedIcon} Transfer Blocked",
+                                    description=(KINGDOM_CHECK_UNAVAILABLE if not lock_ok
+                                                 else f"**{nickname}** wasn't moved. "
+                                                      f"{kingdom_lock_reason(locked_kid, None)}"),
+                                    color=theme.emColor2
+                                ),
+                                view=None
+                            )
+                            return
 
                         with sqlite3.connect('db/users.sqlite') as users_db:
                             cursor = users_db.cursor()
@@ -2773,7 +2859,7 @@ class IDSearchModal(discord.ui.Modal):
 
 class AllianceSelectViewWithAll(discord.ui.View):
     def __init__(self, alliances_with_counts, cog):
-        super().__init__(timeout=300)
+        super().__init__(timeout=menu_timeout())
         self.alliances = alliances_with_counts
         self.cog = cog
         self.current_select = None
@@ -2820,7 +2906,7 @@ class AllianceSelectViewWithAll(discord.ui.View):
 class ExportColumnSelectView(discord.ui.View):
     def __init__(self, alliance_id, alliance_name, cog, include_alliance=False,
                  prefiltered_members=None):
-        super().__init__(timeout=300)
+        super().__init__(timeout=menu_timeout())
         self.alliance_id = alliance_id
         self.alliance_name = alliance_name
         self.cog = cog
@@ -3047,7 +3133,7 @@ class ExportColumnSelectView(discord.ui.View):
 class ExportFormatSelectView(discord.ui.View):
     def __init__(self, alliance_id, alliance_name, selected_columns, cog,
                  prefiltered_members=None):
-        super().__init__(timeout=300)
+        super().__init__(timeout=menu_timeout())
         self.alliance_id = alliance_id
         self.alliance_name = alliance_name
         self.selected_columns = selected_columns
@@ -3250,7 +3336,7 @@ class IDMultiSelectModal(discord.ui.Modal):
 
 class MemberSelectView(discord.ui.View):
     def __init__(self, members, source_alliance_name, cog, page=0, is_remove_operation=False, alliance_id=None, alliances=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.members = members
         self.source_alliance_name = source_alliance_name
         self.cog = cog
@@ -3258,7 +3344,6 @@ class MemberSelectView(discord.ui.View):
         self.max_page = (len(members) - 1) // 25
         self.current_select = None
         self.callback = None
-        self.member_dict = {str(fid): nickname for fid, nickname, _ in members}
         self.selected_alliance_id = alliance_id
         self.alliances = alliances
         self.is_remove_operation = is_remove_operation
@@ -3448,7 +3533,7 @@ class MemberSelectView(discord.ui.View):
 
 class DeleteAllConfirmView(discord.ui.View):
     def __init__(self, parent_view):
-        super().__init__(timeout=60)
+        super().__init__(timeout=confirm_timeout())
         self.parent_view = parent_view
 
     @discord.ui.button(label=f"{theme.verifiedIcon} Confirm Delete All", style=discord.ButtonStyle.danger)
@@ -3474,7 +3559,7 @@ class AlliancePowerRankingsView(discord.ui.View):
 
     def __init__(self, members, alliance_id: int, alliance_name: str,
                  cog, user_id: int):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.members = sorted(
             members,
             key=lambda m: (m[2] if m[2] is not None else -1),
@@ -3487,9 +3572,6 @@ class AlliancePowerRankingsView(discord.ui.View):
         self.current_page = 0
         self.message = None
         self._build_components()
-
-    async def on_timeout(self):
-        await disable_expired_view(self)
 
     def _total_pages(self) -> int:
         if not self.members:

@@ -289,19 +289,6 @@ def validate_time_slot(time_str: str, slot_type: str = "5min") -> bool:
     except (ValueError, AttributeError):
         return False
 
-def round_to_5min_slot(dt: datetime) -> datetime:
-    """
-    Round a datetime to the nearest 5-minute slot
-
-    Args:
-        dt: Datetime object to round
-
-    Returns:
-        Rounded datetime object
-    """
-    minute = (dt.minute // 5) * 5
-    return dt.replace(minute=minute, second=0, microsecond=0)
-
 def cycle_repeat_minutes(event_type: str) -> Optional[int]:
     """Minutes between occurrences of a fixed-cycle event, or None if it has no cycle."""
     cycle_weeks = (get_event_config(event_type) or {}).get("cycle_weeks")
@@ -474,67 +461,50 @@ def calculate_viking_vengeance_dates(from_date: Optional[datetime] = None,
 
     return next_tuesday, next_thursday
 
-def get_available_time_slots(event_type: str) -> Optional[List[str]]:
-    """
-    Get list of available time slots for an event type
 
-    Args:
-        event_type: Name of the event type
+def first_future_occurrence(start: datetime, now: datetime, repeat_days: Optional[int] = None,
+                            weekdays: Optional[List[int]] = None) -> datetime:
+    if start >= now:
+        return start
+    if repeat_days:
+        periods = -(-(now - start) // timedelta(days=repeat_days))
+        return start + timedelta(days=repeat_days * periods)
+    if weekdays:
+        occurrence = start
+        while occurrence < now or occurrence.weekday() not in weekdays:
+            occurrence += timedelta(days=1)
+        return occurrence
+    return start.replace(year=start.year + 1)
 
-    Returns:
-        List of time strings (HH:MM format) or None if times are custom
-    """
-    config = get_event_config(event_type)
-    if not config:
-        return None
 
-    return config.get("available_times")
+def utc_offset_zone_name(tz_input: str) -> str:
+    # 'UTC+3' -> 'Etc/GMT-3', 'UTC+5:30' / 'UTC+5.5' -> 'UTC+05:30'; raises ValueError.
+    text = tz_input.strip().upper()
+    if text == "UTC":
+        return "UTC"
+    if not text.startswith(("UTC+", "UTC-")):
+        raise ValueError(f"Not a UTC offset: {tz_input}")
+    sign = 1 if text[3] == "+" else -1
+    offset = text[4:]
+    if ":" in offset:
+        hours_str, minutes_str = offset.split(":")
+        hours, minutes = int(hours_str), int(minutes_str)
+    else:
+        value = float(offset)
+        hours = int(value)
+        minutes = round((value - hours) * 60)
+    total_minutes = sign * (hours * 60 + minutes)
+    if hours < 0 or not 0 <= minutes < 60 or not -12 * 60 <= total_minutes <= 14 * 60:
+        raise ValueError(f"Offset out of range: {tz_input}")
+    if minutes:
+        return f"UTC{text[3]}{hours:02d}:{minutes:02d}"
+    return f"Etc/GMT{-sign * hours:+d}" if hours else "UTC"
 
-def get_fixed_time(event_type: str) -> Optional[str]:
-    """
-    Get fixed time for events that don't have selectable times
 
-    Args:
-        event_type: Name of the event type
-
-    Returns:
-        Time string (HH:MM format) or None if not applicable
-    """
-    config = get_event_config(event_type)
-    if not config:
-        return None
-
-    return config.get("fixed_time")
-
-def format_event_schedule_description(event_type: str) -> str:
-    """
-    Generate a human-readable description of when an event occurs
-
-    Args:
-        event_type: Name of the event type
-
-    Returns:
-        Formatted description string
-    """
-    config = get_event_config(event_type)
-    if not config:
-        return "Unknown event schedule"
-
-    schedule_type = config.get("schedule_type")
-
-    if schedule_type == "custom":
-        return "Custom schedule set by your alliance"
-    elif schedule_type == "daily":
-        return "Daily at 00:00 UTC"
-    elif schedule_type == "global_weekly":
-        return f"Every {config.get('fixed_days', 'week')}"
-    elif schedule_type == "global_biweekly":
-        if event_type == "Viking Vengeance":
-            return "Every 4 weeks on Tuesday and Thursday"
-        return f"Every 2 weeks on {config.get('fixed_days', 'schedule')}"
-    elif schedule_type in ["global_monthly", "global_4weekly", "global_4weekly_alt"]:
-        return config.get("fixed_days", "Monthly event")
-    elif schedule_type == "global_3weekly_multiday":
-        return config.get("fixed_days", "Every 3 weeks")
-
-    return "Event schedule varies"
+def get_timezone(tz_name: str):
+    # Stored names are pytz zones or fixed offsets like 'UTC+05:30'.
+    if tz_name.startswith(("UTC+", "UTC-")):
+        hours_str, minutes_str = tz_name[4:].split(":")
+        sign = 1 if tz_name[3] == "+" else -1
+        return pytz.FixedOffset(sign * (int(hours_str) * 60 + int(minutes_str)))
+    return pytz.timezone(tz_name)

@@ -1,15 +1,33 @@
 """Gift code settings — test FID management, redemption priority, and auto-redemption setup."""
 
 import discord
-import asyncio
 import sqlite3
 import logging
-import requests
-import json
 
-from .pimp_my_bot import theme, safe_edit_message, check_interaction_user, notify_view_expired
+from .pimp_my_bot import theme, safe_edit_message, check_interaction_user, menu_timeout, confirm_timeout
 from .alliance_member_operations import AllianceSelectView
 from .permission_handler import PermissionManager
+
+DEFAULT_TEST_FID = "47576897"  # a maintainer's account that stays in this kingdom
+DEFAULT_TEST_KID = 259
+
+
+def ensure_test_fid_settings(conn) -> bool:
+    """Create the test ID table and seed the default; True when the default was just seeded."""
+    conn.execute("CREATE TABLE IF NOT EXISTS test_fid_settings ("
+                 "id INTEGER PRIMARY KEY AUTOINCREMENT, test_fid TEXT NOT NULL)")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(test_fid_settings)")]
+    if "kid" not in cols:
+        conn.execute("ALTER TABLE test_fid_settings ADD COLUMN kid INTEGER")
+    # The previous default test ID left kingdom 259; installs still on it move to the new one.
+    conn.execute("UPDATE test_fid_settings SET test_fid = ?, kid = ? WHERE test_fid = '43180889'",
+                 (DEFAULT_TEST_FID, DEFAULT_TEST_KID))
+    seeded = conn.execute("SELECT 1 FROM test_fid_settings LIMIT 1").fetchone() is None
+    if seeded:
+        conn.execute("INSERT INTO test_fid_settings (test_fid, kid) VALUES (?, ?)",
+                     (DEFAULT_TEST_FID, DEFAULT_TEST_KID))
+    conn.commit()
+    return seeded
 
 logger = logging.getLogger('gift')
 
@@ -18,75 +36,20 @@ logger = logging.getLogger('gift')
 # Standalone functions (converted from cog methods: self -> cog)
 # ---------------------------------------------------------------------------
 
-async def verify_test_fid(cog, fid):
-    """
-    Verify that a ID is valid by attempting to login to the account.
-
-    Args:
-        fid (str): The ID to verify
-
-    Returns:
-        tuple: (is_valid, message) where is_valid is a boolean and message is a string
-    """
-    session = None
-    try:
-        cog.logger.info(f"Verifying test ID: {fid}")
-
-        session, response_stove_info = await cog.get_stove_info_wos(fid)
-
-        try:
-            player_info_json = response_stove_info.json()
-        except json.JSONDecodeError:
-            cog.logger.error(f"Invalid JSON response when verifying ID {fid}")
-            return False, "Invalid response from server"
-
-        login_successful = player_info_json.get("msg") == "success"
-
-        if login_successful:
-            try:
-                nickname = player_info_json.get("data", {}).get("nickname", "Unknown")
-                castle_lv = player_info_json.get("data", {}).get("stove_lv", "Unknown")
-                cog.logger.info(f"Test ID {fid} is valid. Nickname: {nickname}, Level: {castle_lv}")
-                return True, "Valid account"
-            except Exception as e:
-                cog.logger.exception(f"Error parsing player info for ID {fid}: {e}")
-                return True, "Valid account (but error getting details)"
-        else:
-            error_msg = player_info_json.get("msg", "Unknown error")
-            cog.logger.info(f"Test ID {fid} is invalid. Error: {error_msg}")
-            return False, f"Login failed: {error_msg}"
-
-    except requests.exceptions.ConnectionError:
-        cog.logger.warning(f"Connection error verifying test ID {fid}. Check bot connectivity to the Kingshot Gift Code API.")
-        return False, "Connection error: Kingshot API unavailable"
-    except requests.exceptions.Timeout:
-        cog.logger.warning(f"Timeout verifying test ID {fid}. Check bot connectivity to the Kingshot Gift Code API.")
-        return False, "Connection error: Request timed out"
-    except requests.exceptions.RequestException as e:
-        cog.logger.warning(f"Request error verifying test ID {fid}: {type(e).__name__}")
-        return False, f"Connection error: {type(e).__name__}"
-    except Exception as e:
-        cog.logger.exception(f"Error verifying test ID {fid}: {e}")
-        return False, f"Verification error: {str(e)}"
-    finally:
-        if session:
-            session.close()
-
-
 def get_test_fid(cog):
     """
     Get the current test ID from the database.
 
     Returns:
-        str: The current test ID, or the default "43180889" if not found
+        str: The current test ID, or DEFAULT_TEST_FID if not found
     """
     try:
         cog.settings_cursor.execute("SELECT test_fid FROM test_fid_settings ORDER BY id DESC LIMIT 1")
         result = cog.settings_cursor.fetchone()
-        return result[0] if result else "43180889"
+        return result[0] if result else DEFAULT_TEST_FID
     except Exception as e:
         cog.logger.exception(f"Error getting test ID: {e}")
-        return "43180889"
+        return DEFAULT_TEST_FID
 
 
 async def update_test_fid(cog, new_fid, kid=None):
@@ -123,7 +86,7 @@ async def get_validation_fid(cog):
     Hierarchy:
     1. Configured test ID (if valid)
     2. Random alliance member ID (if no test ID)
-    3. default test ID (43180889) as fallback
+    3. DEFAULT_TEST_FID as fallback
 
     Returns:
         tuple: (fid, source) where source is 'test_fid', 'alliance_member', or 'default'
@@ -136,12 +99,11 @@ async def get_validation_fid(cog):
         cog.settings_cursor.execute("SELECT test_fid FROM test_fid_settings ORDER BY id DESC LIMIT 1")
         result = cog.settings_cursor.fetchone()
 
-        if result and result[0] != "43180889":
-            # Test ID is configured, verify it's valid
-            is_valid, _ = await verify_test_fid(cog, test_fid)
-            if is_valid:
-                cog.logger.info(f"Using configured test ID for validation: {test_fid}")
-                return test_fid, 'test_fid'
+        if result and result[0] != DEFAULT_TEST_FID:
+            # A configured test ID is used as-is; a bad/kid-less one just yields NO_STATE
+            # during validation, which rotates to member IDs.
+            cog.logger.info(f"Using configured test ID for validation: {test_fid}")
+            return test_fid, 'test_fid'
 
         # Second try: Use a random alliance member
         with sqlite3.connect('db/users.sqlite') as users_conn:
@@ -160,12 +122,12 @@ async def get_validation_fid(cog):
                 return fid, 'alliance_member'
 
         # Third try: Fall back to default ID
-        cog.logger.info("No alliance members found, using default ID for validation: 43180889")
-        return "43180889", 'default'
+        cog.logger.info(f"No alliance members found, using default ID for validation: {DEFAULT_TEST_FID}")
+        return DEFAULT_TEST_FID, 'default'
 
     except Exception as e:
         cog.logger.exception(f"Error in get_validation_fid: {e}")
-        return "43180889", 'default'
+        return DEFAULT_TEST_FID, 'default'
 
 
 
@@ -386,7 +348,7 @@ async def setup_giftcode_auto(cog, interaction: discord.Interaction):
                 color=discord.Color.yellow()
             )
 
-            confirm_view = discord.ui.View()
+            confirm_view = discord.ui.View(timeout=confirm_timeout())
 
             async def button_callback(button_interaction: discord.Interaction):
                 try:
@@ -509,7 +471,7 @@ async def setup_giftcode_auto(cog, interaction: discord.Interaction):
 
 class RedemptionPriorityView(discord.ui.View):
     def __init__(self, cog, alliances_with_priority):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.alliances = alliances_with_priority  # List of (alliance_id, name, priority)
         self.selected_alliance_id = None
@@ -601,32 +563,18 @@ class RedemptionPriorityView(discord.ui.View):
 
     async def _swap_priorities(self, idx1, idx2):
         """Swap the priorities of two alliances in the list and database."""
-        alliance1_id, name1, priority1 = self.alliances[idx1]
-        alliance2_id, name2, priority2 = self.alliances[idx2]
+        self.alliances[idx1], self.alliances[idx2] = self.alliances[idx2], self.alliances[idx1]
 
-        # Assign new sequential priorities based on position
-        new_priority1 = idx2 + 1
-        new_priority2 = idx1 + 1
-
-        # Update database
-        self.cog.cursor.execute("""
-            INSERT INTO giftcodecontrol (alliance_id, status, priority)
-            VALUES (?, 0, ?)
-            ON CONFLICT(alliance_id) DO UPDATE SET priority = excluded.priority
-        """, (alliance1_id, new_priority1))
-
-        self.cog.cursor.execute("""
-            INSERT INTO giftcodecontrol (alliance_id, status, priority)
-            VALUES (?, 0, ?)
-            ON CONFLICT(alliance_id) DO UPDATE SET priority = excluded.priority
-        """, (alliance2_id, new_priority2))
+        # Renumber every alliance so stored priorities always match the displayed order
+        for position, (alliance_id, name, _) in enumerate(self.alliances):
+            self.cog.cursor.execute("""
+                INSERT INTO giftcodecontrol (alliance_id, status, priority)
+                VALUES (?, 0, ?)
+                ON CONFLICT(alliance_id) DO UPDATE SET priority = excluded.priority
+            """, (alliance_id, position + 1))
+            self.alliances[position] = (alliance_id, name, position + 1)
 
         self.cog.conn.commit()
-
-        # Swap in local list
-        self.alliances[idx1] = (alliance1_id, name1, new_priority1)
-        self.alliances[idx2] = (alliance2_id, name2, new_priority2)
-        self.alliances[idx1], self.alliances[idx2] = self.alliances[idx2], self.alliances[idx1]
 
     async def _refresh_view(self, interaction: discord.Interaction):
         """Refresh the embed and view after a priority change."""
@@ -666,7 +614,7 @@ class RedemptionPriorityView(discord.ui.View):
 
 class ClearCacheConfirmView(discord.ui.View):
     def __init__(self, parent_cog):
-        super().__init__(timeout=60)
+        super().__init__(timeout=confirm_timeout())
         self.parent_cog = parent_cog
 
     @discord.ui.button(label="Confirm Clear", style=discord.ButtonStyle.danger, emoji=f"{theme.verifiedIcon}")
@@ -717,8 +665,8 @@ class TestIDModal(discord.ui.Modal, title="Set Test ID"):
         try:
             self.cog.settings_cursor.execute("SELECT test_fid, kid FROM test_fid_settings ORDER BY id DESC LIMIT 1")
             result = self.cog.settings_cursor.fetchone()
-            current_fid = result[0] if result and result[0] != "43180889" else ""
-            current_kid = str(result[1]) if result and result[0] != "43180889" and result[1] is not None else ""
+            current_fid = result[0] if result and result[0] != DEFAULT_TEST_FID else ""
+            current_kid = str(result[1]) if result and result[0] != DEFAULT_TEST_FID and result[1] is not None else ""
         except Exception:
             current_fid = current_kid = ""
 
@@ -789,7 +737,7 @@ class RedemptionSummaryView(discord.ui.View):
     """Pick an alliance, then toggle whether/what its redemption summary posts."""
 
     def __init__(self, cog, user_id: int, alliances):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.user_id = user_id
         self.alliances = alliances            # [(alliance_id, name), ...]
@@ -896,6 +844,3 @@ class RedemptionSummaryView(discord.ui.View):
 
     async def _back(self, interaction: discord.Interaction):
         await self.cog.show_settings_menu(interaction)
-
-    async def on_timeout(self):
-        await notify_view_expired(self, "redemption summary settings")

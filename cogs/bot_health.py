@@ -15,12 +15,19 @@ import zipfile
 import shutil
 from datetime import datetime, timezone, timedelta
 import logging
+from contextlib import closing
 from importlib.metadata import version as get_package_version, PackageNotFoundError
 from packaging.version import parse as parse_version
 import re
 from .permission_handler import PermissionManager
-from .pimp_my_bot import theme, safe_edit_message
+from .pimp_my_bot import (theme, menu_timeout, MenuView, ConfirmView,
+                          get_menu_timeout_minutes, set_menu_timeout_minutes,
+                          MENU_TIMEOUT_MAX_MINUTES, get_confirm_timeout_seconds,
+                          set_confirm_timeout_seconds, CONFIRM_TIMEOUT_MAX_SECONDS, confirm_timeout)
 from .browser_headers import get_headers
+from . import process_queue
+from . import gift_state_resolver
+from .bot_restart import is_container, restart_process
 
 
 # Health status constants
@@ -32,30 +39,6 @@ STATUS_ERROR = "error"
 DB_SIZE_WARNING_MB = 100
 
 
-def is_container() -> bool:
-    """Check if running in a container (Docker, Kubernetes, Podman, LXC, systemd-nspawn)"""
-    # Docker, Kubernetes, Podman - simple marker file checks
-    marker_files = ["/.dockerenv", "/var/run/secrets/kubernetes.io", "/run/.containerenv"]
-    if any(os.path.exists(path) for path in marker_files):
-        return True
-
-    # LXC - check init process environment
-    try:
-        with open("/proc/1/environ", "r") as f:
-            if "container=lxc" in f.read():
-                return True
-    except (IOError, OSError):
-        pass
-
-    # Systemd-nspawn - check container type file
-    try:
-        with open("/run/systemd/container", "r") as f:
-            if f.read().strip() == "systemd-nspawn":
-                return True
-    except (IOError, OSError):
-        pass
-
-    return False
 DB_SIZE_ERROR_MB = 500
 WAL_SIZE_WARNING_MB = 1
 WAL_SIZE_ERROR_MB = 10
@@ -75,6 +58,13 @@ DISK_USED_PCT_ERROR = 95
 # Container RAM usage thresholds (percent of the cgroup limit).
 MEM_USED_PCT_WARNING = 85
 MEM_USED_PCT_ERROR = 95
+
+# Logged errors per 24h before the count shows a warning. Healthy installs log 0-1 a day.
+ERROR_COUNT_WARNING = 20
+ERROR_COUNT_HOURS = 24
+# Category logs with a level field (redemption.txt has none); rotated .1 copies are read too.
+ERROR_COUNT_LOGS = ('bot.txt', 'gift.txt', 'alliance.txt', 'notification.txt')
+ERROR_LINE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),\d+ - \S+ - (?:ERROR|CRITICAL) - ")
 
 # Active log file names (files that should not be archived)
 ACTIVE_LOG_NAMES = [
@@ -117,6 +107,41 @@ UPDATE_ARTIFACTS_DIRS = ['update', 'cogs.bak', '.pip-tmp']
 UPDATE_ARTIFACTS_FILES = ['package.zip', 'main.py.bak', 'requirements.old']
 
 
+def _recent_error_lines(path: str, cutoff: datetime) -> int:
+    if not os.path.isfile(path) or datetime.fromtimestamp(os.path.getmtime(path)) < cutoff:
+        return 0
+    count = 0
+    with open(path, encoding='utf-8', errors='replace') as f:
+        for line in f:
+            match = ERROR_LINE_RE.match(line)
+            if match and datetime.strptime(match.group(1), '%Y-%m-%d %H:%M:%S') >= cutoff:
+                count += 1
+    return count
+
+
+def count_recent_errors(log_dir: str, now: datetime | None = None) -> tuple[int, dict]:
+    """ERROR/CRITICAL lines in the category logs over the last ERROR_COUNT_HOURS, as
+    (total, {log name: count}). Log timestamps are local time, like datetime.now()."""
+    cutoff = (now or datetime.now()) - timedelta(hours=ERROR_COUNT_HOURS)
+    by_file = {}
+    for name in ERROR_COUNT_LOGS:
+        count = sum(_recent_error_lines(os.path.join(log_dir, f), cutoff) for f in (name, f"{name}.1"))
+        if count:
+            by_file[name] = count
+    return sum(by_file.values()), by_file
+
+
+def error_count_status(count: int) -> str:
+    return STATUS_WARNING if count >= ERROR_COUNT_WARNING else STATUS_HEALTHY
+
+
+def error_count_message(count: int, by_file: dict) -> str:
+    if not count:
+        return f"0 in the last {ERROR_COUNT_HOURS} hours"
+    busiest = max(by_file, key=by_file.get)
+    return f"{count} in the last {ERROR_COUNT_HOURS} hours, mostly in {busiest}"
+
+
 def _active_work_summary(bot) -> str | None:
     """Describe in-flight work that would be disrupted by reload/restart, or None if idle."""
     parts = []
@@ -124,16 +149,18 @@ def _active_work_summary(bot) -> str | None:
     if pq is not None:
         try:
             info = pq.get_queue_info()
-            if info.get('is_processing'):
+            # The kingdom scan saves its place and resumes after a reload, so it never blocks one.
+            current = pq.running_info() or {}
+            if info.get('is_processing') and current.get('action') != 'state_resolve':
                 parts.append("a process queue operation is running")
-            queue_size = info.get('queue_size', 0)
+            queue_size = info.get('queue_size', 0) - len(pq.get_queued_processes_by_action('state_resolve'))
             if queue_size > 0:
                 parts.append(f"{queue_size} queued operation(s) waiting")
         except Exception:
             pass
     try:
         from cogs import onnx_lifecycle
-        ocr_active = sum(1 for m in onnx_lifecycle._REGISTRY.values() if m._refcount > 0)
+        ocr_active = onnx_lifecycle.models_in_use()
         if ocr_active:
             parts.append(f"{ocr_active} OCR session(s) in flight")
     except Exception:
@@ -1219,26 +1246,26 @@ class BotHealth(commands.Cog):
                 self.logger.info("Starting scheduled cleanup")
                 results = await self.run_cleanup()
 
-                # Check if monthly optimization is due
-                opt_day = config.get('monthly_optimization_day', 0)
-                if opt_day > 0 and now.day == opt_day:
-                    last_opt = config.get('last_optimization_date')
-                    if last_opt != now.date().isoformat():
-                        self.logger.info("Starting monthly optimization")
-                        opt_results = await self.run_optimization()
-
-                        # Notify admin
-                        notify_id = config.get('notify_user_id')
-                        if notify_id:
-                            await self._notify_user(
-                                notify_id,
-                                f"{theme.verifiedIcon} **Monthly Optimization Complete**\n\n"
-                                f"Recovered {opt_results['space_recovered_mb']:.1f} MB from "
-                                f"{opt_results['databases_optimized']} databases."
-                            )
-
                 # Cleanup old archives
                 await self.cleanup_old_archives(30)
+
+            # Check if monthly optimization is due
+            opt_day = config.get('monthly_optimization_day', 0)
+            if scheduled_passed and opt_day > 0 and now.day == opt_day:
+                last_opt = config.get('last_optimization_date')
+                if last_opt != now.date().isoformat():
+                    self.logger.info("Starting monthly optimization")
+                    opt_results = await self.run_optimization()
+
+                    # Notify admin
+                    notify_id = config.get('notify_user_id')
+                    if notify_id:
+                        await self._notify_user(
+                            notify_id,
+                            f"{theme.verifiedIcon} **Monthly Optimization Complete**\n\n"
+                            f"Recovered {opt_results['space_recovered_mb']:.1f} MB from "
+                            f"{opt_results['databases_optimized']} databases."
+                        )
 
         except Exception as e:
             self.logger.error(f"Error in maintenance loop: {e}")
@@ -1337,6 +1364,11 @@ class BotHealth(commands.Cog):
                 results['failed'].append(cog_name)
                 results['errors'][cog_name] = "Cannot reload bot_health while in use"
                 continue
+            # Importers keep the old module, so a reload would split the OCR model registry in two.
+            if cog_name == "onnx_lifecycle":
+                results['failed'].append(cog_name)
+                results['errors'][cog_name] = "Restart the bot to apply onnx_lifecycle changes"
+                continue
 
             try:
                 # Check if extension is loaded
@@ -1369,12 +1401,7 @@ class BotHealth(commands.Cog):
     async def perform_restart(self, interaction: discord.Interaction,
                               allow_update: bool = False):
         """
-        Perform a bot restart.
-        - Container: Clean exit (orchestrator restarts).
-        - Windows: Exit cleanly and print restart instructions. subprocess.Popen
-          leaves the terminal in a bad state where the parent shell can race
-          input with the spawned bot, so we don't auto-relaunch.
-        - Linux/Mac: os.execl() for in-process replacement.
+        Perform a bot restart through restart_process, which has the per-platform behaviour.
 
         When allow_update=True, the --no-update flag is filtered out of the
         relaunch args so the bot's startup updater can pick up a pending
@@ -1432,39 +1459,8 @@ class BotHealth(commands.Cog):
         # Give Discord a moment to send the message
         await asyncio.sleep(1)
 
-        # Filter --no-update when relaunching for an update
-        relaunch_args = list(sys.argv)
-        if allow_update:
-            relaunch_args = [a for a in relaunch_args if a != "--no-update"]
-
-        if is_container():
-            self.logger.info("Exiting for container restart...")
-            sys.exit(0)
-
-        if is_windows_host:
-            # Print clear restart instructions for the host operator and exit.
-            venv_python = os.path.join("bot_venv", "Scripts", "python.exe")
-            cmd_parts = [
-                venv_python if os.path.exists(venv_python) else "python",
-                *sys.argv,
-            ]
-            if allow_update and "--no-update" in cmd_parts:
-                cmd_parts = [a for a in cmd_parts if a != "--no-update"]
-            print()
-            print("=" * 60)
-            print("  Bot stopped. To restart, run:")
-            print(f"    {' '.join(cmd_parts)}")
-            print("=" * 60)
-            print()
-            sys.exit(0)
-
         self.logger.info("Self-restarting...")
-        try:
-            os.execl(sys.executable, sys.executable, *relaunch_args)
-        except Exception as e:
-            self.logger.error(f"Self-restart failed: {e}")
-            print(f"Self-restart failed: {e}")
-            sys.exit(1)
+        restart_process(allow_update=allow_update)
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -1553,7 +1549,7 @@ class BotHealth(commands.Cog):
 
             overall = self.get_overall_status(db_health, log_health, system_health, wos_api, gift_api, requirements)
 
-            embed = self._build_health_embed(overall, wos_api, gift_api, db_health, log_health, system_health, requirements)
+            embed = await self._build_health_embed(overall, wos_api, gift_api, db_health, log_health, system_health, requirements)
             view = HealthMenuView(self)
 
             await interaction.followup.edit_message(
@@ -1573,7 +1569,13 @@ class BotHealth(commands.Cog):
             except Exception:
                 pass
 
-    def _build_health_embed(self, overall: str, wos_api: dict, gift_api: dict,
+    async def show_servers(self, interaction: discord.Interaction):
+        if not await _bot_owner_only(interaction):
+            return
+        view = ServersView(self, interaction.guild_id)
+        await interaction.response.edit_message(embed=await view.build_embed(), view=view, content=None)
+
+    async def _build_health_embed(self, overall: str, wos_api: dict, gift_api: dict,
                             db_health: dict, log_health: dict, system_health: dict,
                             requirements: dict | None = None) -> discord.Embed:
         """Build the health dashboard embed."""
@@ -1619,6 +1621,7 @@ class BotHealth(commands.Cog):
         )
         disk_health = self.get_disk_health()
         disk_msg = disk_health['message']
+        error_count, errors_by_file = await asyncio.to_thread(count_recent_errors, self.log_path)
 
         uptime = system_health['uptime']
         if uptime.startswith('0h '):
@@ -1665,11 +1668,16 @@ class BotHealth(commands.Cog):
             f"{theme.archiveIcon} {status_prefix(db_health['status'])}**Databases:** {db_health['message']}",
             f"{theme.documentIcon} {status_prefix(log_health['status'])}**Logs:** {log_health['message']}",
         ]
-        if deps_text:
-            storage_lines.append(
-                f"{theme.packageIcon} {deps_prefix}**Dependencies:** {deps_text}"
-            )
         embed.add_field(name="Storage", value="\n".join(storage_lines), inline=True)
+
+        # Full width: these messages are too long for a narrow column.
+        check_lines = [
+            f"{theme.documentIcon} {status_prefix(error_count_status(error_count))}**Logged Errors:** "
+            f"{error_count_message(error_count, errors_by_file)}",
+        ]
+        if deps_text:
+            check_lines.append(f"{theme.packageIcon} {deps_prefix}**Dependencies:** {deps_text}")
+        embed.add_field(name="Errors and Dependencies", value="\n".join(check_lines), inline=False)
 
         embed.add_field(
             name="Actions",
@@ -1681,10 +1689,10 @@ class BotHealth(commands.Cog):
                 f"└ Reload code from disk without restarting the whole bot\n"
                 f"{theme.refreshIcon} **Restart Bot**\n"
                 f"└ Full restart: stops the bot and relaunches it\n"
-                f"{theme.cleanIcon} **Clear Queue**\n"
-                f"└ Remove stuck or pending queued/failed queue items\n"
+                f"{theme.boltIcon} **Running Now**\n"
+                f"└ See long-running work like redemptions and scans, and stop it\n"
                 f"{theme.settingsIcon} **Settings**\n"
-                f"└ Configure cleanup schedule and health thresholds\n"
+                f"└ Cleanup schedule, issue alerts, and how long menus and confirmations stay open\n"
                 f"{theme.lowerDivider}"
             ),
             inline=False,
@@ -1714,11 +1722,10 @@ class HealthMenuView(discord.ui.View):
     """Main Bot Health menu — flat layout with inline restart confirmation."""
 
     def __init__(self, cog: BotHealth):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self._confirming_restart = False
         self._force_restart = False
-        self._confirming_clear = False
         self._build_components()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -1734,21 +1741,6 @@ class HealthMenuView(discord.ui.View):
 
     def _build_components(self):
         self.clear_items()
-        if self._confirming_clear:
-            confirm_btn = discord.ui.Button(
-                label="Clear Queue", emoji=theme.warnIcon,
-                style=discord.ButtonStyle.danger, row=0,
-            )
-            confirm_btn.callback = self._on_confirm_clear
-            self.add_item(confirm_btn)
-            cancel_btn = discord.ui.Button(
-                label="Cancel", emoji=theme.deniedIcon,
-                style=discord.ButtonStyle.secondary, row=0,
-            )
-            cancel_btn.callback = self._on_cancel_clear
-            self.add_item(cancel_btn)
-            return
-
         if self._confirming_restart:
             confirm_btn = discord.ui.Button(
                 label="Restart Anyway" if self._force_restart else "Confirm Restart",
@@ -1796,14 +1788,14 @@ class HealthMenuView(discord.ui.View):
         restart_btn.callback = self._on_restart_request
         self.add_item(restart_btn)
 
-        clear_queue_btn = discord.ui.Button(
-            label="Clear Queue",
-            emoji=theme.cleanIcon,
-            style=discord.ButtonStyle.secondary,
+        running_btn = discord.ui.Button(
+            label="Running Now",
+            emoji=theme.boltIcon,
+            style=discord.ButtonStyle.primary,
             row=1,
         )
-        clear_queue_btn.callback = self._on_clear_queue_request
-        self.add_item(clear_queue_btn)
+        running_btn.callback = self._on_running_now
+        self.add_item(running_btn)
 
         settings_btn = discord.ui.Button(
             label="Settings",
@@ -1930,7 +1922,7 @@ class HealthMenuView(discord.ui.View):
         overall = self.cog.get_overall_status(
             db_health, log_health, system_health, wos_api, gift_api, requirements
         )
-        embed = self.cog._build_health_embed(
+        embed = await self.cog._build_health_embed(
             overall, wos_api, gift_api, db_health, log_health, system_health, requirements
         )
         embed.add_field(
@@ -1973,6 +1965,7 @@ class HealthMenuView(discord.ui.View):
         )
 
     async def _on_confirm_restart(self, interaction: discord.Interaction):
+        await interaction.response.defer()
         await self.cog.perform_restart(interaction)
 
     async def _on_cancel_restart(self, interaction: discord.Interaction):
@@ -1989,7 +1982,7 @@ class HealthMenuView(discord.ui.View):
         overall = self.cog.get_overall_status(
             db_health, log_health, system_health, wos_api, gift_api, requirements
         )
-        embed = self.cog._build_health_embed(
+        embed = await self.cog._build_health_embed(
             overall, wos_api, gift_api, db_health, log_health, system_health, requirements
         )
         await interaction.response.edit_message(embed=embed, view=self)
@@ -2004,58 +1997,13 @@ class HealthMenuView(discord.ui.View):
         overall = self.cog.get_overall_status(
             db_health, log_health, system_health, wos_api, gift_api, requirements
         )
-        return self.cog._build_health_embed(
+        return await self.cog._build_health_embed(
             overall, wos_api, gift_api, db_health, log_health, system_health, requirements
         )
 
-    def _build_clear_confirm_embed(self, counts: dict) -> discord.Embed:
-        return discord.Embed(
-            title=f"{theme.warnIcon} Clear Queue",
-            description=(
-                f"Remove pending and failed items from the process queue?\n\n"
-                f"**Queued:** {counts['queued']}\n"
-                f"**Failed:** {counts['failed']}\n"
-                f"**Active (kept):** {counts['active']}\n\n"
-                f"This clears stuck or backed-up work (e.g. gift redemptions that "
-                f"piled up after errors or restarts). Anything currently running is "
-                f"left alone. This cannot be undone."
-            ),
-            color=0xFF0000,
-        )
-
-    async def _on_clear_queue_request(self, interaction: discord.Interaction):
-        pq = self.cog.bot.get_cog("ProcessQueue")
-        counts = pq.queue_counts() if pq else {"queued": 0, "active": 0, "completed": 0, "failed": 0}
-        if counts["queued"] + counts["failed"] == 0:
-            await interaction.response.send_message(
-                f"{theme.verifiedIcon} The queue is already clear. Nothing is pending or failed.",
-                ephemeral=True,
-            )
-            return
-        self._confirming_clear = True
-        self._build_components()
-        await interaction.response.edit_message(
-            embed=self._build_clear_confirm_embed(counts), view=self
-        )
-
-    async def _on_confirm_clear(self, interaction: discord.Interaction):
-        pq = self.cog.bot.get_cog("ProcessQueue")
-        removed = pq.clear_processes(("queued", "failed")) if pq else 0
-        self.cog.logger.info(f"Bot Health: admin cleared {removed} queued/failed process(es)")
-        self._confirming_clear = False
-        self._build_components()
-        embed = await self._dashboard_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-        await interaction.followup.send(
-            f"{theme.verifiedIcon} Cleared {removed} queued/failed queue item(s).",
-            ephemeral=True,
-        )
-
-    async def _on_cancel_clear(self, interaction: discord.Interaction):
-        self._confirming_clear = False
-        self._build_components()
-        embed = await self._dashboard_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
+    async def _on_running_now(self, interaction: discord.Interaction):
+        view = RunningNowView(self.cog)
+        await interaction.response.edit_message(embed=await view.build_embed(), view=view, content=None)
 
     async def _on_back(self, interaction: discord.Interaction):
         try:
@@ -2067,10 +2015,345 @@ class HealthMenuView(discord.ui.View):
             print(f"Error returning to maintenance menu: {e}")
 
 
+def describe_job(process: dict, alliance_names: dict) -> str:
+    """One plain-language line for a queue job."""
+    action, details = process['action'], process.get('details') or {}
+    alliance = alliance_names.get(process.get('alliance_id')) or details.get('alliance_name') or "an alliance"
+    if action == 'gift_validate':
+        return f"Checking gift code `{details.get('giftcode', '?')}`"
+    if action == 'gift_redeem':
+        return f"Redeeming gift code `{details.get('giftcode', '?')}` for {alliance}"
+    if action == 'gift_redeem_member':
+        who = details.get('nickname') or details.get('fid', '?')
+        count = len(details.get('codes') or [])
+        return f"Redeeming {count} missed {'code' if count == 1 else 'codes'} for {who}"
+    if action == 'member_add':
+        return f"Adding members to {details.get('alliance_name') or alliance}"
+    if action == 'state_resolve':
+        total = details.get('total', 0)
+        checked = total - len(details.get('remaining') or [])
+        name = "Kingdom auto-scan" if details.get('mode') == 'auto' else "Kingdom scan"
+        return f"{name} ({checked}/{total} members)"
+    if action == 'api_sync':
+        return f"Player sync for {alliance}" if details.get('alliance_id') else "Player sync, all alliances"
+    return action
+
+
+def _alliance_names() -> dict:
+    try:
+        return dict(PermissionManager.list_alliances())
+    except sqlite3.Error:
+        return {}
+
+
+async def _global_admin_only(interaction: discord.Interaction) -> bool:
+    # Re-check per interaction: the menu-open gate doesn't cover button clicks.
+    is_admin, is_global = PermissionManager.is_admin(interaction.user.id)
+    if not (is_admin and is_global):
+        await interaction.response.send_message(
+            f"{theme.deniedIcon} Only global admins can use the Bot Health menu.", ephemeral=True)
+        return False
+    return True
+
+
+class RunningNowView(MenuView):
+    """Bot Health -> Running Now: long-running work, with Stop and Clear Queue."""
+
+    MAX_LISTED = 10
+
+    def __init__(self, cog):
+        super().__init__()
+        self.cog = cog
+        self.last_result = None
+        self.jobs = {}
+        self.names = {}
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _global_admin_only(interaction)
+
+    def _queue(self):
+        return self.cog.bot.get_cog("ProcessQueue")
+
+    def _button(self, label, emoji, style, row, callback):
+        button = discord.ui.Button(label=label, emoji=emoji, style=style, row=row)
+        button.callback = callback
+        self.add_item(button)
+
+    async def build_embed(self) -> discord.Embed:
+        pq = self._queue()
+        self.names = names = await asyncio.to_thread(_alliance_names)
+        running = pq.running_info() if pq else None
+        queued = pq.queued_processes() if pq else []
+        self.jobs = {p['id']: p for p in ([running] if running else []) + queued}
+        self.clear_items()
+
+        lines = [
+            "Work that takes a while, like gift code redemptions, member adds and kingdom scans. "
+            "You can stop anything that's stuck or no longer needed.\n",
+            f"{theme.upperDivider}",
+        ]
+        if running:
+            minutes = int((datetime.now() - running['started']).total_seconds() // 60) if running.get('started') else 0
+            lines.append(f"{theme.boltIcon} **Running:** {describe_job(running, names)}")
+            if running.get('stopping'):
+                lines.append("└ Stopping at its next safe point...")
+            elif running['action'] in process_queue.STOPPABLE_ACTIONS:
+                lines.append(f"└ Running for {minutes} min.")
+            else:
+                lines.append(f"└ Running for {minutes} min. This one can't be stopped and finishes on its own.")
+        else:
+            lines.append(f"{theme.boltIcon} **Running:** nothing right now.")
+        lines.append(f"{theme.hourglassIcon} **Waiting in the queue:** `{len(queued)}`")
+        lines += [f"└ {describe_job(p, names)}" for p in queued[:self.MAX_LISTED]]
+        if len(queued) > self.MAX_LISTED:
+            lines.append(f"└ ...and {len(queued) - self.MAX_LISTED} more")
+        from . import gift_redemption, onnx_lifecycle
+        ocr = onnx_lifecycle.models_in_use()
+        if ocr:
+            lines.append(f"{theme.globeIcon} **Screenshot reading (OCR):** {ocr} {'reader' if ocr == 1 else 'readers'} busy. "
+                         f"This finishes on its own.")
+        gift_cog = self.cog.bot.get_cog("GiftOperations")
+        pause = gift_redemption.rate_limit_wait(gift_cog) if gift_cog else 0
+        if pause:
+            lines.append(f"{theme.timeIcon} **Gift code API limit:** redemptions are paused for another {int(pause)}s.")
+        lines.append(f"{theme.lowerDivider}")
+        lines += [
+            f"{theme.deniedIcon} **Pick a job**",
+            "└ Stop a job from the list. A running job stops at its next safe point.",
+            f"{theme.refreshIcon} **Refresh**",
+            "└ Check progress again.",
+            f"{theme.cleanIcon} **Clear Queue**",
+            "└ Remove every waiting and failed job at once.",
+        ]
+        if self.last_result:
+            lines.append(f"\n{theme.verifiedIcon} {self.last_result}")
+
+        options = []
+        if running and running['action'] in process_queue.STOPPABLE_ACTIONS and not running.get('stopping'):
+            options.append(discord.SelectOption(label=describe_job(running, names)[:100],
+                                                value=str(running['id']), description="Running now"))
+        options += [discord.SelectOption(label=describe_job(p, names)[:100], value=str(p['id']),
+                                         description="Waiting in the queue") for p in queued[:25 - len(options)]]
+        if options:
+            select = discord.ui.Select(placeholder="Pick a job to stop", options=options, row=0)
+            select.callback = self._on_pick
+            self.add_item(select)
+        self._button("Refresh", theme.refreshIcon, discord.ButtonStyle.primary, 1, self._on_refresh)
+        self._button("Clear Queue", theme.cleanIcon, discord.ButtonStyle.secondary, 1, self._on_clear_request)
+        self._button("Back", theme.backIcon, discord.ButtonStyle.secondary, 1, self._on_back)
+        return discord.Embed(title=f"{theme.boltIcon} Running Now", description="\n".join(lines),
+                             color=theme.emColor1)
+
+    def confirm_embed(self, pid) -> discord.Embed:
+        """The 'are you sure?' text for stopping job `pid`, or for Clear Queue when pid is None."""
+        if pid is None:
+            pq = self._queue()
+            counts = pq.queue_counts() if pq else {'queued': 0, 'failed': 0, 'active': 0}
+            text = (f"Remove every waiting and failed job?\n\n**Waiting:** {counts['queued']}\n"
+                    f"**Failed:** {counts['failed']}\n**Running (kept):** {counts['active']}\n\n"
+                    f"This can't be undone.")
+            return discord.Embed(title=f"{theme.warnIcon} Clear Queue", description=text, color=theme.emColor4)
+        job = self.jobs.get(pid)
+        what = describe_job(job, self.names) if job else "This job"
+        text = (f"**{what}**\n\n"
+                + ("It stops at its next safe point. Work it already finished is kept."
+                   if job and job.get('started') else "It's removed from the queue and won't run."))
+        return discord.Embed(title=f"{theme.warnIcon} Stop This Job?", description=text, color=theme.emColor4)
+
+    async def _show(self, interaction: discord.Interaction):
+        await interaction.response.edit_message(embed=await self.build_embed(), view=self, content=None)
+
+    async def _ask(self, interaction: discord.Interaction, pid):
+        if pid is None:
+            await _ask_confirm(interaction, self, "Clear Queue", self.clear_queue, self.confirm_embed(pid))
+        else:
+            await _ask_confirm(interaction, self, "Stop", lambda: self.stop_job(pid), self.confirm_embed(pid))
+
+    async def _on_pick(self, interaction: discord.Interaction):
+        await self._ask(interaction, int(interaction.data["values"][0]))
+
+    async def _on_refresh(self, interaction: discord.Interaction):
+        self.last_result = None
+        await self._show(interaction)
+
+    async def _on_clear_request(self, interaction: discord.Interaction):
+        await self._ask(interaction, None)
+
+    async def stop_job(self, pid):
+        pq = self._queue()
+        job = self.jobs.get(pid) or {}
+        outcome = pq.cancel_process(pid) if pq else 'gone'
+        self.cog.logger.info(f"Bot Health: admin stopped process id={pid} ({outcome})")
+        self.last_result = {
+            'removed': "Removed it from the queue.",
+            'stopping': "Stopping it. It finishes up at its next safe point.",
+            'unstoppable': "That job can't be stopped mid-run. It finishes on its own.",
+        }.get(outcome, "That job had already finished.")
+        is_auto_scan = job.get('action') == 'state_resolve' and (job.get('details') or {}).get('mode') == 'auto'
+        if is_auto_scan and outcome in ('removed', 'stopping'):
+            await asyncio.to_thread(gift_state_resolver.set_scan_enabled, False)
+            self.last_result += (" Auto-scan is switched off too, so it doesn't start again. "
+                                 "Turn it back on under Alliances -> Member Kingdoms -> Kingdom Scan.")
+
+    async def clear_queue(self):
+        pq = self._queue()
+        removed = pq.clear_processes(("queued", "failed")) if pq else 0
+        self.cog.logger.info(f"Bot Health: admin cleared {removed} queued/failed process(es)")
+        self.last_result = f"Cleared {removed} waiting or failed {'job' if removed == 1 else 'jobs'}."
+
+    async def _on_back(self, interaction: discord.Interaction):
+        view = HealthMenuView(self.cog)
+        await interaction.response.edit_message(embed=await view._dashboard_embed(), view=view, content=None)
+
+
+
+async def _ask_confirm(interaction: discord.Interaction, parent, label: str, action, embed: discord.Embed):
+    confirm = _HealthConfirmView(parent, interaction.message, label, action)
+    await interaction.response.send_message(embed=embed, view=confirm, ephemeral=True)
+    confirm.message = await interaction.original_response()
+
+
+class _HealthConfirmView(ConfirmView):
+    """Ephemeral 'are you sure?'; Confirm runs `action` and refreshes the parent menu message."""
+
+    def __init__(self, parent, parent_message: discord.Message, label: str, action):
+        super().__init__(f"{label.lower()} confirmation")
+        self.parent, self.parent_message, self.action = parent, parent_message, action
+        for text, emoji, style, callback in (
+                (label, theme.warnIcon, discord.ButtonStyle.danger, self._confirm),
+                ("Cancel", theme.deniedIcon, discord.ButtonStyle.secondary, self._cancel)):
+            button = discord.ui.Button(label=text, emoji=emoji, style=style)
+            button.callback = callback
+            self.add_item(button)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await self.parent.interaction_check(interaction)
+
+    async def _confirm(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.defer()
+        await self.action()
+        await self.parent_message.edit(embed=await self.parent.build_embed(), view=self.parent, content=None)
+        await interaction.delete_original_response()
+
+    async def _cancel(self, interaction: discord.Interaction):
+        self.stop()
+        await interaction.response.defer()
+        await interaction.delete_original_response()
+
+
+async def _bot_owner_only(interaction: discord.Interaction) -> bool:
+    if PermissionManager.is_owner(interaction.user.id):
+        return True
+    await interaction.response.send_message(
+        f"{theme.deniedIcon} Only the bot owner can manage the servers the bot is in.", ephemeral=True)
+    return False
+
+
+def _alliances_per_server() -> dict:
+    try:
+        with closing(sqlite3.connect(PermissionManager.ALLIANCE_DB)) as db:
+            return dict(db.execute(
+                "SELECT discord_server_id, COUNT(*) FROM alliance_list GROUP BY discord_server_id").fetchall())
+    except sqlite3.Error:
+        return {}
+
+
+def _plural(count: int, word: str) -> str:
+    return f"{count} {word}{'' if count == 1 else 's'}"
+
+
+class ServersView(MenuView):
+    """Maintenance -> Leave a Server: every server the bot is in; the bot owner can make it leave one."""
+
+    MAX_LISTED = 25
+
+    def __init__(self, cog, current_guild_id: int | None):
+        super().__init__()
+        self.cog = cog
+        self.current_guild_id = current_guild_id
+        self.last_result = None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return await _bot_owner_only(interaction)
+
+    def _describe(self, guild: discord.Guild, alliances: dict) -> str:
+        return (f"{_plural(guild.member_count or 0, 'member')}, "
+                f"{_plural(alliances.get(guild.id, 0), 'alliance')}")
+
+    async def build_embed(self) -> discord.Embed:
+        alliances = await asyncio.to_thread(_alliances_per_server)
+        guilds = sorted(self.cog.bot.guilds, key=lambda g: g.name.lower())
+        others = [g for g in guilds if g.id != self.current_guild_id]
+        self.clear_items()
+
+        lines = [
+            "Every Discord server this bot is in. You can make the bot leave a server here, "
+            "even one you're no longer a member of.\n",
+            f"{theme.upperDivider}",
+        ]
+        for guild in guilds[:self.MAX_LISTED]:
+            here = " (this server)" if guild.id == self.current_guild_id else ""
+            lines.append(f"{theme.globeIcon} **{discord.utils.escape_markdown(guild.name)}**{here}")
+            lines.append(f"└ {self._describe(guild, alliances)}")
+        if len(guilds) > self.MAX_LISTED:
+            lines.append(f"└ ...and {len(guilds) - self.MAX_LISTED} more")
+        lines += [
+            f"{theme.lowerDivider}",
+            f"{theme.deniedIcon} **Pick a server**",
+            "└ Make the bot leave it. You're asked to confirm first.",
+            "To remove the bot from this server, kick it from the member list here.",
+        ]
+        if self.last_result:
+            lines.append(f"\n{theme.verifiedIcon} {self.last_result}")
+
+        if others:
+            options = [discord.SelectOption(label=g.name[:100], value=str(g.id),
+                                            description=self._describe(g, alliances)[:100])
+                       for g in others[:25]]
+            select = discord.ui.Select(placeholder="Pick a server to leave", options=options, row=0)
+            select.callback = self._on_pick
+            self.add_item(select)
+        back = discord.ui.Button(label="Back", emoji=theme.backIcon, style=discord.ButtonStyle.secondary, row=1)
+        back.callback = self._on_back
+        self.add_item(back)
+        return discord.Embed(title=f"{theme.shutdownDoorIcon} Leave a Server", description="\n".join(lines),
+                             color=theme.emColor1)
+
+    def confirm_embed(self, guild: discord.Guild) -> discord.Embed:
+        text = (f"The bot leaves **{discord.utils.escape_markdown(guild.name)}** right away.\n\n"
+                f"Its alliances and member data stay in the bot's database. Scheduled notifications "
+                f"for that server are paused. To bring the bot back, someone with Manage Server "
+                f"permission there has to invite it again.")
+        return discord.Embed(title=f"{theme.warnIcon} Leave This Server?", description=text, color=theme.emColor4)
+
+    async def leave(self, guild_id: int):
+        guild = self.cog.bot.get_guild(guild_id)
+        if guild is None:
+            self.last_result = "The bot had already left that server."
+            return
+        await guild.leave()
+        self.cog.logger.info(f"Bot Health: owner made the bot leave server {guild.name} ({guild.id})")
+        self.last_result = f"The bot left **{discord.utils.escape_markdown(guild.name)}**."
+
+    async def _on_pick(self, interaction: discord.Interaction):
+        guild_id = int(interaction.data["values"][0])
+        guild = self.cog.bot.get_guild(guild_id)
+        if guild is None:
+            self.last_result = "The bot had already left that server."
+            await interaction.response.edit_message(embed=await self.build_embed(), view=self, content=None)
+            return
+        await _ask_confirm(interaction, self, "Leave Server", lambda: self.leave(guild_id),
+                           self.confirm_embed(guild))
+
+    async def _on_back(self, interaction: discord.Interaction):
+        await self.cog.bot.get_cog("MainMenu").show_maintenance(interaction)
+
+
 class CleanCogsConfirmView(discord.ui.View):
     """Confirmation view for cleaning unused cog files"""
     def __init__(self, cog: BotHealth, unused_files: list, parent_view: HealthMenuView):
-        super().__init__(timeout=60)
+        super().__init__(timeout=confirm_timeout())
         self.cog = cog
         self.unused_files = unused_files
         self.parent_view = parent_view
@@ -2159,7 +2442,7 @@ class CleanCogsConfirmView(discord.ui.View):
         system_health = self.cog.get_system_health()
 
         overall = self.cog.get_overall_status(db_health, log_health, system_health, wos_api, gift_api)
-        embed = self.cog._build_health_embed(overall, wos_api, gift_api, db_health, log_health, system_health)
+        embed = await self.cog._build_health_embed(overall, wos_api, gift_api, db_health, log_health, system_health)
 
         await interaction.followup.edit_message(message_id=interaction.message.id, embed=embed, view=self.parent_view)
 
@@ -2170,7 +2453,7 @@ class ReloadCogsView(discord.ui.View):
     PAGE_SIZE = 25
 
     def __init__(self, cog: BotHealth, loaded_cogs: list, parent_view: HealthMenuView):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.loaded_cogs = loaded_cogs
         self.parent_view = parent_view
@@ -2200,7 +2483,7 @@ class ReloadCogsView(discord.ui.View):
         options = []
         for cog_name in page_cogs:
             is_selected = cog_name in self.selected_cogs
-            if cog_name == "bot_health":
+            if cog_name in ("bot_health", "onnx_lifecycle"):
                 options.append(discord.SelectOption(
                     label=cog_name, value=cog_name,
                     description="Cannot reload (in use)",
@@ -2306,7 +2589,7 @@ class ReloadCogsView(discord.ui.View):
         system_health = self.cog.get_system_health()
 
         overall = self.cog.get_overall_status(db_health, log_health, system_health, wos_api, gift_api)
-        embed = self.cog._build_health_embed(overall, wos_api, gift_api, db_health, log_health, system_health)
+        embed = await self.cog._build_health_embed(overall, wos_api, gift_api, db_health, log_health, system_health)
 
         await interaction.followup.edit_message(
             message_id=interaction.message.id,
@@ -2488,6 +2771,24 @@ class HealthSettingsModal(discord.ui.Modal, title="Health Settings"):
         )
         self.add_item(self.notify_id)
 
+        self.menu_timeout = discord.ui.TextInput(
+            label="Menu timeout (minutes, 0 = never)",
+            placeholder="120",
+            default=str(get_menu_timeout_minutes()),
+            max_length=4,
+            required=True
+        )
+        self.add_item(self.menu_timeout)
+
+        self.confirm_timeout = discord.ui.TextInput(
+            label="Confirm dialog timeout (seconds, 0 = never)",
+            placeholder="60",
+            default=str(get_confirm_timeout_seconds()),
+            max_length=4,
+            required=True
+        )
+        self.add_item(self.confirm_timeout)
+
     async def on_submit(self, interaction: discord.Interaction):
         try:
             # Parse cleanup time
@@ -2509,6 +2810,20 @@ class HealthSettingsModal(discord.ui.Modal, title="Health Settings"):
             if self.notify_id.value.strip():
                 notify_id = int(self.notify_id.value.strip())
 
+            try:
+                menu_minutes = int(self.menu_timeout.value.strip())
+            except ValueError:
+                menu_minutes = -1
+            if not 0 <= menu_minutes <= MENU_TIMEOUT_MAX_MINUTES:
+                raise ValueError(f"Menu timeout must be 0-{MENU_TIMEOUT_MAX_MINUTES} minutes (0 = never)")
+            try:
+                confirm_seconds = int(self.confirm_timeout.value.strip())
+            except ValueError:
+                confirm_seconds = -1
+            if not 0 <= confirm_seconds <= CONFIRM_TIMEOUT_MAX_SECONDS:
+                raise ValueError(f"Confirm dialog timeout must be 0-{CONFIRM_TIMEOUT_MAX_SECONDS} "
+                                 f"seconds (0 = never)")
+
             # Update config
             self.cog.update_config(
                 cleanup_hour=hour,
@@ -2517,12 +2832,21 @@ class HealthSettingsModal(discord.ui.Modal, title="Health Settings"):
                 notify_user_id=notify_id
             )
 
+            set_menu_timeout_minutes(menu_minutes)
+            set_confirm_timeout_seconds(confirm_seconds)
+            menu_text = (f"{menu_minutes} {'minute' if menu_minutes == 1 else 'minutes'}" if menu_minutes
+                         else "Never (menus stay usable until the bot restarts)")
+            confirm_text = (f"{confirm_seconds} {'second' if confirm_seconds == 1 else 'seconds'}"
+                            if confirm_seconds else "Never")
+
             embed = discord.Embed(
                 title=f"{theme.verifiedIcon} Settings Updated",
                 description=(
                     f"**Daily Cleanup:** {hour:02d}:{minute:02d} UTC\n"
                     f"**Monthly Deep Cleanup:** {'Day ' + str(monthly_day) if monthly_day else 'Disabled'}\n"
-                    f"**Notifications:** {f'<@{notify_id}>' if notify_id else 'Disabled'}"
+                    f"**Notifications:** {f'<@{notify_id}>' if notify_id else 'Disabled'}\n"
+                    f"**Menu Timeout:** {menu_text}. Menus you open from now on use this.\n"
+                    f"**Confirm Dialog Timeout:** {confirm_text}"
                 ),
                 color=theme.emColor3
             )

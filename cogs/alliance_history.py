@@ -6,12 +6,16 @@ from discord.ext import commands
 import sqlite3
 import logging
 import re
-from .alliance_member_operations import AllianceSelectView
-from .permission_handler import PermissionManager
-from .pimp_my_bot import theme
+from .pimp_my_bot import theme, menu_timeout
 from . import alliance_power_changes
 
 logger = logging.getLogger('alliance')
+
+MAX_HISTORY_FIELDS = 25  # Discord's per-embed field limit
+
+
+def _history_cap_note(total: int) -> str:
+    return f"**Showing:** the latest {MAX_HISTORY_FIELDS} of {total} changes\n" if total > MAX_HISTORY_FIELDS else ""
 
 
 def _fmt_power(n) -> str:
@@ -62,7 +66,7 @@ class _SingleHistoryResultView(discord.ui.View):
     """Wraps a single-member history embed with Back + Post to Channel."""
 
     def __init__(self, cog, alliance_id, history_type: str, embed: discord.Embed):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.alliance_id = alliance_id
         self.history_type = history_type  # "furnace", "nickname", "power", or "combat_power"
@@ -101,7 +105,7 @@ class _PostToChannelPickerView(discord.ui.View):
     PAGE_SIZE = 25
 
     def __init__(self, channels, embed_to_post, requester):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.channels = list(channels)
         self.embed_to_post = embed_to_post
         self.requester = requester
@@ -275,12 +279,13 @@ class AllianceHistory(commands.Cog):
                     f"**Player:** `{nickname}`\n"
                     f"**ID:** `{fid}`\n"
                     f"**Current Level:** `{self.level_mapping.get(current_level, str(current_level))}`\n"
+                    f"{_history_cap_note(len(changes))}"
                     f"{theme.upperDivider}\n"
                 ),
                 color=theme.emColor1
             )
 
-            for old_level, new_level, change_date in changes:
+            for old_level, new_level, change_date in changes[:MAX_HISTORY_FIELDS]:
                 old_level_str = self.level_mapping.get(int(old_level), str(old_level))
                 new_level_str = self.level_mapping.get(int(new_level), str(new_level))
                 embed.add_field(
@@ -339,12 +344,13 @@ class AllianceHistory(commands.Cog):
                     f"**Player:** `{nickname}`\n"
                     f"**ID:** `{fid}`\n"
                     f"**Current Level:** `{self.level_mapping.get(current_level, str(current_level))}`\n"
+                    f"{_history_cap_note(len(changes))}"
                     f"{theme.upperDivider}\n"
                 ),
                 color=theme.emColor1
             )
 
-            for old_name, new_name, change_date in changes:
+            for old_name, new_name, change_date in changes[:MAX_HISTORY_FIELDS]:
                 embed.add_field(
                     name=f"Nickname Change at {change_date}",
                     value=f"{theme.avatarOldIcon} `{old_name}` ➜ {theme.avatarIcon} `{new_name}`",
@@ -535,11 +541,12 @@ class AllianceHistory(commands.Cog):
                     f"**Player:** `{nickname}`\n"
                     f"**ID:** `{fid}`\n"
                     f"**Current {label}:** `{_fmt_power(current)}`\n"
+                    f"{_history_cap_note(len(changes))}"
                     f"{theme.upperDivider}\n"
                 ),
                 color=theme.emColor1,
             )
-            for ch in changes:
+            for ch in changes[:MAX_HISTORY_FIELDS]:
                 badge = alliance_power_changes.format_delta(ch["pct"])
                 embed.add_field(
                     name=f"Change at {ch['change_date'][:10]}",
@@ -762,7 +769,7 @@ class HistoryTypeView(discord.ui.View):
     """Hub-context history-type picker — alliance is already known."""
 
     def __init__(self, cog, alliance_id: int):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.alliance_id = alliance_id
 
@@ -800,7 +807,7 @@ class HistoryTypeView(discord.ui.View):
 
 class MemberListView(discord.ui.View):
     def __init__(self, cog, members, alliance_name, alliance_id=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.members = members
         self.alliance_name = alliance_name
@@ -1045,7 +1052,7 @@ class FurnaceHistoryIDSearchModal(discord.ui.Modal, title="Search by ID"):
 
 class MemberListViewNickname(discord.ui.View):
     def __init__(self, cog, members, alliance_name, alliance_id=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.members = members
         self.alliance_name = alliance_name
@@ -1290,7 +1297,7 @@ class NicknameHistoryIDSearchModal(discord.ui.Modal, title="Search by ID"):
 
 class MemberListViewPower(discord.ui.View):
     def __init__(self, cog, members, alliance_name, alliance_id, metric):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.members = members
         self.alliance_name = alliance_name
@@ -1458,7 +1465,7 @@ class CustomTimeModal(discord.ui.Modal, title="Custom Time Range"):
 class RecentChangesView(discord.ui.View):
     def __init__(self, chunks, members, level_mapping, alliance_name, time,
                  cog=None, alliance_id=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.chunks = chunks
         self.members = members
         self.level_mapping = level_mapping
@@ -1529,7 +1536,7 @@ class RecentChangesView(discord.ui.View):
 class RecentNicknameChangesView(discord.ui.View):
     def __init__(self, chunks, members, alliance_name, time,
                  cog=None, alliance_id=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.chunks = chunks
         self.members = members
         self.alliance_name = alliance_name

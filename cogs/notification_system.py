@@ -13,9 +13,9 @@ import json
 import traceback
 import time
 import re
-from .notification_event_types import get_event_types, get_event_icon
+from .notification_event_types import get_event_types, get_event_icon, get_timezone, utc_offset_zone_name
 from .permission_handler import PermissionManager
-from .pimp_my_bot import theme, safe_edit_message
+from .pimp_my_bot import theme, safe_edit_message, menu_timeout, confirm_timeout, use_guild_theme
 
 logger = logging.getLogger('notification')
 
@@ -30,6 +30,18 @@ def _format_paused_line(event_type, hour, minute, timezone, description, channel
         short = "(Embed notification)"
     where = f" in {channel_label}" if channel_label else ""
     return f"- **{event_type or 'Custom'} {hour:02d}:{minute:02d} ({timezone})**{where} - {short}"
+
+
+def next_weekday_time(after, weekdays, hour, minute, tz):
+    # Localize each candidate date separately so the UTC offset follows DST.
+    local_date = after.astimezone(tz).date()
+    for offset in range(8):
+        day = local_date + timedelta(days=offset)
+        if day.weekday() in weekdays:
+            candidate = tz.localize(datetime(day.year, day.month, day.day, hour, minute))
+            if candidate > after:
+                return candidate
+    return None
 
 
 # Friendly wording for pause reasons shown to admins (console + quarantine DM).
@@ -643,7 +655,7 @@ class NotificationSystem(commands.Cog):
                     title = embed_data.get("title", "true")
                     notification_description = f"EMBED_MESSAGE:{title}"
 
-            tz = pytz.timezone(timezone)
+            tz = get_timezone(timezone)
             naive_dt = start_date.replace(
                 hour=hour,
                 minute=minute,
@@ -698,7 +710,7 @@ class NotificationSystem(commands.Cog):
             elif "EMBED_MESSAGE:" in description:
                 title = embed_data.get("title", "true") if embed_data else "true"
                 notification_description = f"EMBED_MESSAGE:{title}"
-            tz = pytz.timezone(timezone)
+            tz = get_timezone(timezone)
 
             # If start_date is provided, use it as the base date (for wizard updates)
             if start_date:
@@ -879,7 +891,8 @@ class NotificationSystem(commands.Cog):
                 now = datetime.now(pytz.UTC)
                 for notification in notifications:
                     try:
-                        await self.process_notification(notification)
+                        with use_guild_theme(notification[1]):
+                            await self.process_notification(notification)
                     except Exception as e:
                         logger.error(f"Error processing notification {notification[0]}: {e}")
                         print(f"Error processing notification {notification[0]}: {e}")
@@ -947,7 +960,7 @@ class NotificationSystem(commands.Cog):
                                           scheduled_delete_at: datetime | None):
         """Store a sent message ID for later deletion"""
         current_time_str = datetime.now(pytz.UTC).strftime('%Y-%m-%d %H:%M:%S')
-        delete_at_str = scheduled_delete_at.isoformat() if scheduled_delete_at else None
+        delete_at_str = scheduled_delete_at.astimezone(pytz.UTC).isoformat() if scheduled_delete_at else None
 
         self.cursor.execute("""
             INSERT INTO notification_history
@@ -1021,6 +1034,13 @@ class NotificationSystem(commands.Cog):
             logger.error(f"Error deleting previous notifications: {e}")
             print(f"Error deleting previous notifications: {e}")
 
+    def _notification_weekdays(self, notification_id):
+        self.cursor.execute("SELECT weekday FROM notification_days WHERE notification_id = ?", (notification_id,))
+        weekdays = set()
+        for row in self.cursor.fetchall():
+            weekdays.update(int(p) for p in row[0].split('|') if p)
+        return weekdays
+
     async def process_notification(self, notification):
         id = None  # Initialize to avoid UnboundLocalError in exception handler
         try:
@@ -1032,7 +1052,7 @@ class NotificationSystem(commands.Cog):
             if not is_enabled:
                 return
 
-            tz = pytz.timezone(timezone)
+            tz = get_timezone(timezone)
             now = datetime.now(tz)
             next_time = datetime.fromisoformat(next_notification)
 
@@ -1045,22 +1065,8 @@ class NotificationSystem(commands.Cog):
                         next_time = next_time + timedelta(minutes=repeat_minutes * periods_passed)
 
                     elif repeat_minutes == -1:
-                        self.cursor.execute("""
-                                    SELECT weekday FROM notification_days
-                                    WHERE notification_id = ?
-                                """, (id,))
-                        rows = self.cursor.fetchall()
-                        notification_days = set()
-
-                        for row in rows:
-                            parts = row[0].split('|')
-                            notification_days.update(int(p) for p in parts if p)
-
-                        for next_day in range(1, 8):
-                            potential_day = now + timedelta(days=next_day)
-                            if potential_day.weekday() in notification_days:
-                                next_time = potential_day.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                                break
+                        weekdays = self._notification_weekdays(id)
+                        next_time = next_weekday_time(now, weekdays, hour, minute, tz) or next_time
 
                 elif repeat_minutes == 0:
                     # Handle non-repeating notifications: Keep time, but set date to today
@@ -1156,7 +1162,12 @@ class NotificationSystem(commands.Cog):
                         mention_text = f"Role {role_id}"
                 elif mention_type.startswith("member_"):
                     member_id = int(mention_type.split("_")[1])
-                    member = await channel.guild.fetch_member(member_id)
+                    member = channel.guild.get_member(member_id)
+                    if member is None:
+                        try:
+                            member = await channel.guild.fetch_member(member_id)
+                        except (discord.NotFound, discord.HTTPException):
+                            member = None
                     if member:
                         mention_text = member.mention
                     else:
@@ -1435,22 +1446,8 @@ class NotificationSystem(commands.Cog):
                         next_time = current_next + timedelta(minutes=repeat_minutes)
 
                     elif repeat_minutes == -1:
-                        self.cursor.execute("""
-                                    SELECT weekday FROM notification_days
-                                    WHERE notification_id = ?
-                                """, (id,))
-                        rows = self.cursor.fetchall()
-                        notification_days = set()
-
-                        for row in rows:
-                            parts = row[0].split('|')
-                            notification_days.update(int(p) for p in parts if p)
-
-                        for next_day in range(1, 8):
-                            potential_day = now + timedelta(days=next_day)
-                            if potential_day.weekday() in notification_days:
-                                next_time = potential_day.replace(hour=hour, minute=minute, second=0, microsecond=0)
-                                break
+                        weekdays = self._notification_weekdays(id)
+                        next_time = next_weekday_time(max(now, next_time), weekdays, hour, minute, tz) or next_time
 
                     self.cursor.execute("""
                         UPDATE bear_notifications
@@ -1580,30 +1577,6 @@ class NotificationSystem(commands.Cog):
             logger.error(f"Error getting all wizard notifications: {e}")
             print(f"Error getting all wizard notifications: {e}")
             return []
-
-    def delete_wizard_notifications_for_channel(self, guild_id: int, channel_id: int, event_types_to_keep: list = None) -> int:
-        """Delete wizard notifications that are no longer needed"""
-        try:
-            wizard_batch_id = f"wizard_{guild_id}_{channel_id}"
-            if event_types_to_keep:
-                placeholders = ",".join(["?"] * len(event_types_to_keep))
-                self.cursor.execute(f"""
-                    DELETE FROM bear_notifications
-                    WHERE guild_id = ? AND channel_id = ? AND wizard_batch_id = ?
-                    AND event_type NOT IN ({placeholders})
-                """, (guild_id, channel_id, wizard_batch_id, *event_types_to_keep))
-            else:
-                self.cursor.execute("""
-                    DELETE FROM bear_notifications
-                    WHERE guild_id = ? AND channel_id = ? AND wizard_batch_id = ?
-                """, (guild_id, channel_id, wizard_batch_id))
-            deleted_count = self.cursor.rowcount
-            self.conn.commit()
-            return deleted_count
-        except Exception as e:
-            logger.error(f"Error deleting wizard notifications: {e}")
-            print(f"Error deleting wizard notifications: {e}")
-            return 0
 
     async def toggle_notification(self, notification_id: int, enabled: bool, skip_board_update: bool = False) -> bool:
         try:
@@ -1738,7 +1711,7 @@ class NotificationSystem(commands.Cog):
 class RepeatOptionView(discord.ui.View):
     def __init__(self, cog, start_date, hour, minute, timezone, description, channel_id, notification_type,
                  mention_type, original_message, event_type=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.start_date = start_date
         self.hour = hour
@@ -1987,7 +1960,7 @@ class RepeatIntervalModal(discord.ui.Modal):
 
 class DaysMenu(discord.ui.View):
     def __init__(self, repeat_view):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.repeat_view = repeat_view
         self.selected_days = []
 
@@ -2066,7 +2039,7 @@ class TextInputModal(discord.ui.Modal):
 
 class EmbedEditorView(discord.ui.View):
     def __init__(self, cog, start_date, hour, minute, timezone, original_message, event_type=None):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.start_date = start_date
         self.hour = hour
@@ -2372,7 +2345,7 @@ class EmbedEditorView(discord.ui.View):
 
 class MessageTypeView(discord.ui.View):
     def __init__(self, cog, start_date, hour, minute, timezone):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.start_date = start_date
         self.hour = hour
@@ -2458,7 +2431,7 @@ class EventTypeSelectView(discord.ui.View):
     """View for selecting event type when creating embed notifications"""
 
     def __init__(self, cog, start_date, hour, minute, timezone, original_message):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.start_date = start_date
         self.hour = hour
@@ -2673,8 +2646,11 @@ class TimeSelectModal(discord.ui.Modal):
     async def on_submit(self, interaction: discord.Interaction):
         try:
             try:
-                timezone = pytz.timezone(self.timezone.value)
-            except pytz.exceptions.UnknownTimeZoneError:
+                tz_name = self.timezone.value.strip()
+                if tz_name.upper().startswith(("UTC+", "UTC-")):
+                    tz_name = utc_offset_zone_name(tz_name)
+                timezone = get_timezone(tz_name)
+            except (pytz.exceptions.UnknownTimeZoneError, ValueError):
                 await interaction.response.send_message(
                     f"{theme.deniedIcon} Invalid timezone! Please use a valid timezone (e.g., UTC, Europe/Istanbul).",
                     ephemeral=True
@@ -2710,7 +2686,7 @@ class TimeSelectModal(discord.ui.Modal):
                 start_date,
                 hour,
                 minute,
-                self.timezone.value
+                tz_name
             )
 
             embed = discord.Embed(
@@ -2750,7 +2726,7 @@ class TimeSelectModal(discord.ui.Modal):
 
 class NotificationTypeView(discord.ui.View):
     def __init__(self, cog, start_date, hour, minute, timezone, message_data, channel_id, original_message, event_type=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.start_date = start_date
         self.hour = hour
@@ -2911,7 +2887,7 @@ class CustomTimesModal(discord.ui.Modal):
 class MentionTypeView(discord.ui.View):
     def __init__(self, cog, start_date, hour, minute, timezone, message_data, channel_id, notification_type,
                  original_message, event_type=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.start_date = start_date
         self.hour = hour
@@ -2998,7 +2974,7 @@ class MentionTypeView(discord.ui.View):
                     )
 
             select.callback = user_select_callback
-            view = discord.ui.View(timeout=7200)
+            view = discord.ui.View(timeout=menu_timeout())
             view.add_item(select)
 
             await interaction.response.edit_message(
@@ -3039,7 +3015,7 @@ class MentionTypeView(discord.ui.View):
                     )
 
             select.callback = role_select_callback
-            view = discord.ui.View(timeout=7200)
+            view = discord.ui.View(timeout=menu_timeout())
             view.add_item(select)
 
             await interaction.response.edit_message(
@@ -3072,7 +3048,7 @@ class MentionTypeView(discord.ui.View):
 
 class SettingsView(discord.ui.View):
     def __init__(self, cog, delete_enabled: bool, default_delay: int):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.delete_enabled = delete_enabled
         self.default_delay = default_delay
@@ -3214,7 +3190,7 @@ class SettingsView(discord.ui.View):
 
 class BearTrapView(discord.ui.View):
     def __init__(self, cog):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         # Use cog's connection instead of creating new one
         self.conn = cog.conn
@@ -3368,7 +3344,7 @@ class BearTrapView(discord.ui.View):
                     if notif[15]:  # next_notification
                         try:
                             next_time = datetime.fromisoformat(notif[15])
-                            tz = pytz.timezone(notif[5])
+                            tz = get_timezone(notif[5])
                             next_time_local = next_time.astimezone(tz)
                             time_display = next_time_local.strftime("%m/%d %H:%M")
                         except Exception:
@@ -3620,7 +3596,7 @@ class BearTrapView(discord.ui.View):
                         color=theme.emColor1
                     )
 
-                    view = discord.ui.View()
+                    view = discord.ui.View(timeout=menu_timeout())
 
                     class PreviewButton(discord.ui.Button):
                         def __init__(self, cog, notification_id):
@@ -3731,7 +3707,7 @@ class BearTrapView(discord.ui.View):
                                     embed_json = json.dumps(copyable_data, indent=2)
 
                                     # Create view with a "Show Code" button
-                                    view = discord.ui.View()
+                                    view = discord.ui.View(timeout=menu_timeout())
                                     view.add_item(ShowCodeButton(embed_json))
 
                                     await interaction.response.send_message(
@@ -3875,7 +3851,7 @@ class BearTrapView(discord.ui.View):
 
                         async def callback(self, interaction: discord.Interaction):
                             try:
-                                confirm_view = discord.ui.View()
+                                confirm_view = discord.ui.View(timeout=confirm_timeout())
 
                                 confirm_button = discord.ui.Button(label="Confirm", style=discord.ButtonStyle.danger)
                                 cancel_button = discord.ui.Button(label="Cancel", style=discord.ButtonStyle.primary)
@@ -3885,7 +3861,7 @@ class BearTrapView(discord.ui.View):
                                         result = await self.cog.delete_notification(self.notification_id)
 
                                         if result:
-                                            new_view = discord.ui.View()
+                                            new_view = discord.ui.View(timeout=menu_timeout())
 
                                             for row in interaction.message.components:
                                                 for item in row.children:
@@ -4082,7 +4058,7 @@ class BearTrapView(discord.ui.View):
                                         )
 
                                 channel_select.callback = channel_select_callback
-                                temp_view = discord.ui.View()
+                                temp_view = discord.ui.View(timeout=menu_timeout())
                                 temp_view.add_item(channel_select)
 
                                 await interaction.response.send_message(
@@ -4133,8 +4109,9 @@ class BearTrapView(discord.ui.View):
 
                     help_text += f"- **{theme.trashIcon} Delete:** Remove the selected notification.\n\n"
 
+                    details_embed.description += f"\n{help_text}"
                     await select_interaction.response.edit_message(
-                        content=help_text,
+                        content=None,
                         embed=details_embed,
                         view=view
                     )
@@ -4149,7 +4126,7 @@ class BearTrapView(discord.ui.View):
 
             select.callback = select_callback
 
-            view = discord.ui.View()
+            view = discord.ui.View(timeout=menu_timeout())
             view.add_item(select)
             if total_pages > 1:
                 view.add_item(prev_button)
@@ -4297,7 +4274,7 @@ class BearTrapView(discord.ui.View):
 
 class ChannelSelectView(discord.ui.View):
     def __init__(self, cog, start_date, hour, minute, timezone, message_data, original_message, event_type=None):
-        super().__init__(timeout=7200)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.start_date = start_date
         self.hour = hour

@@ -11,9 +11,9 @@ import math
 import traceback
 import logging
 import asyncio
-from .notification_event_types import get_event_icon, get_instance_display_name
+from .notification_event_types import get_event_icon, get_instance_display_name, get_timezone, utc_offset_zone_name
 from .permission_handler import PermissionManager
-from .pimp_my_bot import theme, safe_edit_message
+from .pimp_my_bot import theme, safe_edit_message, menu_timeout, confirm_timeout, use_guild_theme
 
 class NotificationSchedule(commands.Cog):
     def __init__(self, bot):
@@ -148,7 +148,7 @@ class NotificationSchedule(commands.Cog):
 
                 for tz_str in timezones:
                     try:
-                        tz = pytz.timezone(tz_str)
+                        tz = self._get_timezone_object(tz_str)
                         now_in_tz = now_utc.astimezone(tz)
 
                         # Check if it's 00:01 in this timezone (1-minute window)
@@ -641,7 +641,7 @@ class NotificationSchedule(commands.Cog):
 
                         # Generate occurrences for each matching weekday
                         current_date = next_time.date()
-                        event_tz = pytz.timezone(notif_timezone)
+                        event_tz = get_timezone(notif_timezone)
 
                         for day_offset in range(1, 31):  # Check next 30 days
                             check_date = current_date + timedelta(days=day_offset)
@@ -963,31 +963,10 @@ class NotificationSchedule(commands.Cog):
             - "Etc/GMT+3" -> pytz timezone
             - "UTC+05:30" -> Fixed offset timezone
         """
-        from datetime import timezone, timedelta
-
-        if tz_string == "UTC":
+        try:
+            return get_timezone(tz_string)
+        except Exception:
             return pytz.UTC
-        elif tz_string.startswith("UTC+") or tz_string.startswith("UTC-"):
-            # Parse fractional offset like UTC+05:30
-            try:
-                sign = 1 if tz_string[3] == '+' else -1
-                parts = tz_string[4:].split(':')
-                if len(parts) == 2:
-                    hours = int(parts[0])
-                    minutes = int(parts[1])
-                    total_minutes = sign * (hours * 60 + minutes)
-                    return timezone(timedelta(minutes=total_minutes))
-                else:
-                    # Shouldn't happen with our validation, but fallback
-                    return pytz.UTC
-            except Exception:
-                return pytz.UTC
-        else:
-            # Etc/GMT zones or other standard pytz timezones
-            try:
-                return pytz.timezone(tz_string)
-            except Exception:
-                return pytz.UTC
 
     def _format_timezone_display(self, tz_zone: str) -> str:
         """Convert timezone name to user-friendly format
@@ -1050,6 +1029,12 @@ class NotificationSchedule(commands.Cog):
         Updates a schedule board by regenerating and editing the Discord message.
         Returns True if successful, False otherwise.
         """
+        self.cursor.execute("SELECT guild_id FROM notification_schedule_boards WHERE id = ?", (board_id,))
+        row = self.cursor.fetchone()
+        with use_guild_theme(row[0] if row else None):
+            return await self._render_schedule_board(board_id)
+
+    async def _render_schedule_board(self, board_id: int) -> bool:
         # Acquire lock to prevent concurrent updates
         async with self._board_update_lock:
             try:
@@ -1069,10 +1054,16 @@ class NotificationSchedule(commands.Cog):
                 # Get channel and message
                 channel = self.bot.get_channel(channel_id)
                 if not channel:
-                    self.logger.warning(f"[SCHEDULE] Channel {channel_id} not found, removing board {board_id}")
-                    self.cursor.execute("DELETE FROM notification_schedule_boards WHERE id = ?", (board_id,))
-                    self.conn.commit()
-                    return False
+                    try:
+                        channel = await self.bot.fetch_channel(channel_id)
+                    except discord.NotFound:
+                        self.logger.warning(f"[SCHEDULE] Channel {channel_id} not found, removing board {board_id}")
+                        self.cursor.execute("DELETE FROM notification_schedule_boards WHERE id = ?", (board_id,))
+                        self.conn.commit()
+                        return False
+                    except Exception as e:
+                        self.logger.warning(f"[SCHEDULE] Could not fetch channel {channel_id} for board {board_id}: {e}")
+                        return False
 
                 try:
                     message = await channel.fetch_message(message_id)
@@ -1306,7 +1297,7 @@ class ScheduleBoardPaginationView(discord.ui.View):
 class ScheduleBoardMainView(discord.ui.View):
     """Main menu for schedule board management"""
     def __init__(self, cog, guild_id: int, boards: list):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.guild_id = guild_id
         self.boards = boards
@@ -1363,7 +1354,7 @@ class ScheduleBoardMainView(discord.ui.View):
 class CreateBoardTypeView(discord.ui.View):
     """Step 1: Select board type with buttons"""
     def __init__(self, cog, guild_id: int):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.guild_id = guild_id
 
@@ -1420,7 +1411,7 @@ class CreateBoardTypeView(discord.ui.View):
 class CreateBoardChannelSelectView(discord.ui.View):
     """Step 2: Select channels (target channel + display channel)"""
     def __init__(self, cog, guild_id: int, board_type: str):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.guild_id = guild_id
         self.board_type = board_type
@@ -1527,7 +1518,7 @@ class CreateBoardSettingsView(discord.ui.View):
     """Step 3: Configure board settings with buttons"""
     def __init__(self, cog, guild_id: int, board_type: str, target_channel_id: int,
                  display_channel_id: int, creator_id: int):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.guild_id = guild_id
         self.board_type = board_type
@@ -1899,7 +1890,7 @@ class CreateBoardSettingsView(discord.ui.View):
 class BoardCreatedSuccessView(discord.ui.View):
     """View shown after successfully creating a board"""
     def __init__(self, cog, guild_id: int):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.guild_id = guild_id
 
@@ -1915,7 +1906,7 @@ class BoardCreatedSuccessView(discord.ui.View):
 class BoardSelectionView(discord.ui.View):
     """View to select which board to manage"""
     def __init__(self, cog, guild_id: int, boards: list, guild: discord.Guild = None):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.guild_id = guild_id
         self.boards = boards
@@ -1994,7 +1985,7 @@ class BoardSelectionView(discord.ui.View):
 class BoardManagementView(discord.ui.View):
     """View to manage a specific board (edit/delete/move/preview)"""
     def __init__(self, cog, guild_id: int, board_id: int):
-        super().__init__(timeout=None)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.guild_id = guild_id
         self.board_id = board_id
@@ -2105,7 +2096,7 @@ class BoardManagementView(discord.ui.View):
 
             channel_select.callback = channel_callback
 
-            view = discord.ui.View(timeout=60)
+            view = discord.ui.View(timeout=confirm_timeout())
             view.add_item(channel_select)
 
             await interaction.response.edit_message(
@@ -2148,7 +2139,7 @@ class BoardManagementView(discord.ui.View):
 
             channel_select.callback = channel_callback
 
-            view = discord.ui.View(timeout=60)
+            view = discord.ui.View(timeout=confirm_timeout())
             view.add_item(channel_select)
 
             await interaction.response.edit_message(
@@ -2176,11 +2167,7 @@ class BoardManagementView(discord.ui.View):
         try:
             await interaction.response.defer(ephemeral=True)
             embed = await self.cog.generate_schedule_embed(self.board_id, page=0)
-            await interaction.followup.send(
-                "**Preview of schedule board:**",
-                embed=embed,
-                ephemeral=True
-            )
+            await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as e:
             self.cog.logger.error(f"[ERROR] Error in preview: {e}")
             print(f"[ERROR] Error in preview: {e}")
@@ -2209,7 +2196,7 @@ class BoardManagementView(discord.ui.View):
 class EditBoardSettingsView(discord.ui.View):
     """Interactive view to edit board settings with buttons"""
     def __init__(self, cog, board_id: int, guild_id: int):
-        super().__init__(timeout=300)
+        super().__init__(timeout=menu_timeout())
         self.cog = cog
         self.board_id = board_id
         self.guild_id = guild_id
@@ -2394,28 +2381,7 @@ class EditBoardSettingsView(discord.ui.View):
                     try:
                         tz_input = self.timezone_input.value.strip()
 
-                        # Parse timezone (same logic as before)
-                        if tz_input.upper() == "UTC":
-                            tz_name = "UTC"
-                        elif tz_input.upper().startswith("UTC+") or tz_input.upper().startswith("UTC-"):
-                            offset_str = tz_input[3:]
-                            if ':' in offset_str:
-                                parts = offset_str.split(':')
-                                hours = int(parts[0])
-                                minutes = int(parts[1])
-                                offset_hours = hours + (minutes / 60.0) if hours >= 0 else hours - (minutes / 60.0)
-                            else:
-                                offset_hours = float(offset_str)
-
-                            if offset_hours >= 0:
-                                tz_name = f"Etc/GMT-{int(offset_hours)}"
-                            else:
-                                tz_name = f"Etc/GMT+{int(abs(offset_hours))}"
-                        else:
-                            raise ValueError("Invalid timezone format")
-
-                        # Validate timezone
-                        pytz.timezone(tz_name)
+                        tz_name = utc_offset_zone_name(tz_input)
 
                         # Update database
                         parent_view.cog.cursor.execute("""
@@ -2645,7 +2611,7 @@ class EditBoardSettingsView(discord.ui.View):
 class ConfirmDeleteView(discord.ui.View):
     """Confirmation view for deleting a board"""
     def __init__(self, cog, guild_id: int, board_id: int):
-        super().__init__(timeout=None)
+        super().__init__(timeout=confirm_timeout())
         self.cog = cog
         self.guild_id = guild_id
         self.board_id = board_id

@@ -69,6 +69,7 @@ def _bootstrap_from_main_branch(zip_url):
 
 try:
     from cogs import bot_startup_display as startup
+    from cogs.bot_restart import restart_process
 except ImportError:
     # cogs/ is missing (likely a bare main.py drop). Fetch the full source for this branch and restart.
     _bootstrap_from_main_branch(os.environ.get(
@@ -223,10 +224,8 @@ if sys.prefix == sys.base_prefix and not should_skip_venv():
     # Determine the python executable path in the venv
     if sys.platform == "win32":
         venv_python_name = os.path.join(venv_path, "Scripts", "python.exe")
-        activate_script = os.path.join(venv_path, "Scripts", "activate.bat")
     else:
         venv_python_name = os.path.join(venv_path, "bin", "python")
-        activate_script = os.path.join(venv_path, "bin", "activate")
 
     if not os.path.exists(venv_path):
         try:
@@ -692,9 +691,7 @@ def setup_dependencies(beta_mode=False):
     """Main function to set up all dependencies."""
     startup.phase_start("Checking dependencies")
 
-    removed_obsolete = False
     if has_obsolete_requirements():
-        removed_obsolete = True
         safe_remove("requirements.txt", is_dir=False)
 
     if not os.path.exists("requirements.txt"):
@@ -719,10 +716,6 @@ try:
 except ImportError as e:
     startup.error_box("Import Failed", f"Import failed after dependency setup: {e}", "Restart the script or run: pip install -r requirements.txt")
     sys.exit(1)
-
-# Colorama shortcuts
-F = Fore
-R = Style.RESET_ALL
 
 import warnings
 import aiohttp
@@ -784,6 +777,26 @@ except ImportError:
     pass  # Certifi not found, SSL verification might fail
 except Exception:
     pass  # SSL patch error, continue anyway
+
+
+def unwrap_markdown_gift_codes(conn):
+    """Store gift codes saved with chat markdown (`CODE`) bare; the API answers those with
+    Sign Error forever. Returns how many rows were fixed. Their attempts held no real results."""
+    wrapped = [row[0] for row in conn.execute("SELECT giftcode FROM gift_codes")
+               if any(mark in row[0] for mark in "`*_")]
+    # The gift cog adds validation_status after this runs; on a pre-cog DB a missing status already means pending.
+    has_status = "validation_status" in {row[1] for row in conn.execute("PRAGMA table_info(gift_codes)")}
+    rename = ("UPDATE gift_codes SET giftcode = ?, validation_status = 'pending' WHERE giftcode = ?"
+              if has_status else "UPDATE gift_codes SET giftcode = ? WHERE giftcode = ?")
+    for code in wrapped:
+        clean = code.replace("`", "").replace("*", "").replace("_", "").strip()
+        conn.execute("DELETE FROM user_giftcodes WHERE giftcode = ?", (code,))
+        clean_exists = conn.execute("SELECT 1 FROM gift_codes WHERE giftcode = ?", (clean,)).fetchone()
+        if clean.isalnum() and clean.isascii() and not clean_exists:
+            conn.execute(rename, (clean, code))
+        else:
+            conn.execute("DELETE FROM gift_codes WHERE giftcode = ?", (code,))
+    return len(wrapped)
 
 
 def raise_open_file_limit(floor=1024, target=4096):
@@ -870,29 +883,6 @@ if __name__ == "__main__":
         )
         sys.exit(1)
 
-    def restart_bot():
-        python = sys.executable
-        script_path = os.path.abspath(sys.argv[0])
-        # Filter out --no-venv and --repair from restart args to avoid loops
-        filtered_args = [arg for arg in sys.argv[1:] if arg not in ["--no-venv", "--repair"]]
-        args = [python, script_path] + filtered_args
-
-        if sys.platform == "win32":
-            # For Windows, provide direct venv command like initial setup
-            venv_path = "bot_venv"
-            venv_python_name = os.path.join(venv_path, "Scripts", "python.exe")
-            startup.venv_exists_instructions(venv_python_name, sys.platform)
-            sys.exit(0)
-        else:
-            # For non-Windows, try automatic restart
-            print("  Restarting bot...")
-            try:
-                subprocess.Popen(args)
-                os._exit(0)
-            except Exception as e:
-                print(f"Error restarting: {e}")
-                os.execl(python, python, script_path, *sys.argv[1:])
-            
     def install_packages(requirements_txt_path: str, debug: bool = False) -> bool:
         """Install packages from requirements.txt file using pip install -r."""
         full_command = [sys.executable, "-m", "pip", "install", "-r", requirements_txt_path, "--no-cache-dir"]
@@ -1146,7 +1136,7 @@ if __name__ == "__main__":
 
                         startup.phase_ok(f"Update completed ({latest_tag} from {source_name})")
 
-                        restart_bot()
+                        restart_process()
                     else:
                         startup.phase_fail("Update failed", details=[f"HTTP {download_resp.status_code} from {source_name}"])
                         return
@@ -1480,6 +1470,10 @@ if __name__ == "__main__":
                 ("discord_server_id",       "INTEGER"),
                 ("discord_id_updated_at",   "TEXT"),
                 ("state_mismatch_at",       "TEXT"),
+                ("kingdom_scan_next",       "INTEGER"),
+                ("kingdom_scan_done_at",    "TEXT"),
+                ("avatar_url",              "TEXT"),
+                ("api_synced_at",           "TEXT"),
             ]
             for _col, _typ in _users_columns_to_add:
                 try:
@@ -1508,6 +1502,9 @@ if __name__ == "__main__":
             uc_cols = [row[1] for row in conn_giftcode.execute("PRAGMA table_info(user_giftcodes)").fetchall()]
             if "last_attempt_at" not in uc_cols:
                 conn_giftcode.execute("ALTER TABLE user_giftcodes ADD COLUMN last_attempt_at TEXT")
+            fixed_codes = unwrap_markdown_gift_codes(conn_giftcode)
+            if fixed_codes:
+                logging.getLogger('bot').info(f"Stored {fixed_codes} markdown-wrapped gift code(s) without the markdown")
 
         with connections["conn_id_channel"] as conn_id_channel:
             conn_id_channel.execute("""CREATE TABLE IF NOT EXISTS id_channels (
@@ -1557,6 +1554,14 @@ if __name__ == "__main__":
                 conn_alliance.execute(
                     "ALTER TABLE alliancesettings ADD COLUMN ocr_upload_admin_only INTEGER DEFAULT 0"
                 )
+
+            # Who may edit an uploaded screenshot review: 'uploader', 'admins' or 'anyone'.
+            for _col in ("ocr_review_editors", "bear_review_editors"):
+                try:
+                    conn_alliance.execute(f"SELECT {_col} FROM alliancesettings LIMIT 1")
+                except sqlite3.OperationalError:
+                    conn_alliance.execute(
+                        f"ALTER TABLE alliancesettings ADD COLUMN {_col} TEXT DEFAULT 'uploader'")
 
             # Per-alliance toggle for @silent sync posts (0 = ring, 1 = no notification ping).
             try:
@@ -1645,7 +1650,7 @@ if __name__ == "__main__":
     startup.phase_ok("Database ready")
 
     async def load_cogs():
-        cogs = ["pimp_my_bot", "process_queue", "onnx_lifecycle", "bot_main_menu", "alliance", "alliance_member_operations", "bot_operations", "alliance_logs", "bot_support", "bot_health", "gift_operations", "alliance_history", "alliance_w_command", "bot_startup", "notification_system", "notification_schedule", "alliance_id_channel", "alliance_channels", "bot_backup", "notification_editor", "notification_templates", "notification_wizard", "attendance", "attendance_report", "attendance_ocr", "minister_schedule", "minister_menu", "minister_archive", "alliance_registration", "bear_track"]
+        cogs = ["pimp_my_bot", "process_queue", "onnx_lifecycle", "bot_main_menu", "alliance", "alliance_member_operations", "alliance_api_sync", "bot_operations", "alliance_logs", "bot_support", "bot_health", "gift_operations", "alliance_history", "alliance_w_command", "bot_startup", "notification_system", "notification_schedule", "alliance_id_channel", "alliance_channels", "bot_backup", "notification_editor", "notification_templates", "notification_wizard", "attendance", "attendance_report", "attendance_ocr", "minister_schedule", "minister_menu", "minister_archive", "alliance_registration", "bear_track"]
 
         failed_cogs = []
 
