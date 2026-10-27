@@ -2,7 +2,35 @@
 import os
 import sqlite3
 
+import pytest
+
 from extension import storage
+
+
+@pytest.mark.parametrize("fid", [100, 200], ids=["main", "secondary"])
+def test_guarded_registration_preserves_other_owner(tmp_path, fid):
+    db = str(tmp_path)
+    storage.register_player(fid=100, discord_id=42, nickname="Main", db_dir=db)
+    storage.register_player(fid=200, discord_id=42, nickname="Alt", db_dir=db)
+    before = dict(storage.user_row(fid, db_dir=db))
+    assert storage.register_player(
+        fid=fid, discord_id=43, nickname="Replacement", alliance_aid=999,
+        reject_other_owner=True, db_dir=db) is False
+    assert dict(storage.user_row(fid, db_dir=db)) == before
+    assert storage.alliance_row(999, db_dir=db) is None
+    assert storage.fids_for_discord(42, db_dir=db) == [(100, True), (200, False)]
+
+
+def test_guarded_registration_allows_unbound_and_same_owner(tmp_path):
+    db = str(tmp_path)
+    storage.register_player(fid=100, discord_id=None, db_dir=db)
+    assert storage.register_player(fid=100, discord_id=42, reject_other_owner=True, db_dir=db)
+    assert storage.register_player(fid=100, discord_id=42, nickname="Updated",
+                                   reject_other_owner=True, db_dir=db)
+    assert storage.user_row(100, db_dir=db)["nickname"] == "Updated"
+    # The explicit admin binding path retains its reassignment capability.
+    assert storage.register_player(fid=100, discord_id=43, db_dir=db)
+    assert storage.discord_for_fid(100, db_dir=db) == 43
 
 
 def test_register_player_first_is_main(tmp_path):

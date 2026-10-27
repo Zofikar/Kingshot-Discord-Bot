@@ -474,18 +474,24 @@ def upsert_alliance(aid, *, abbr=None, name=None, kid=None, role_id=None, power=
 
 def register_player(*, fid, discord_id, discord_server_id=None, nickname=None, kid=None,
                     alliance_aid=None, rank=None, power=None, abbr=None, alliance_name=None,
-                    db_dir: str = "db") -> None:
+                    db_dir: str = "db", reject_other_owner: bool = False) -> bool:
     """Upsert a user row (and its alliance), promoting to main if first.
 
     Re-registering a fid already owned by the same user keeps its existing main
     flag (no accidental demotion).
+    With reject_other_owner, atomically return False without changing an owned
+    account belonging to someone else. Explicit admin binding may still reassign.
     """
     ensure_schema(db_dir)
     with _connect(os.path.join(db_dir, USERS_FILE)) as conn:
         with conn:
+            conn.execute("BEGIN IMMEDIATE")
             existing = conn.execute(
                 "SELECT discord_id, COALESCE(is_main, 0) FROM users WHERE fid = ?", (fid,)
             ).fetchone()
+            if (reject_other_owner and existing and existing[0] is not None
+                    and existing[0] != discord_id):
+                return False
             if existing and existing[0] == discord_id:
                 is_main = existing[1]
             else:
@@ -511,6 +517,7 @@ def register_player(*, fid, discord_id, discord_server_id=None, nickname=None, k
         # nightly player sync must not overwrite the fresh alliance snapshot.
         upsert_alliance(alliance_aid, abbr=abbr, name=alliance_name, kid=kid,
                         db_dir=db_dir)
+    return True
 
 
 def alliance_row(aid, *, db_dir: str = "db"):

@@ -333,6 +333,14 @@ class IdentityMightpulse(commands.Cog):
 
     async def _verify(self, interaction, gid: str):
         await interaction.response.defer(ephemeral=True)
+        ownership_denial = (
+            "This ID is already registered to another Discord user. "
+            "Contact an admin if this needs to be fixed."
+        )
+        owner = storage.discord_for_fid(gid)
+        if owner is not None and owner != interaction.user.id:
+            await interaction.followup.send(ownership_denial, ephemeral=True)
+            return
         settings = _settings(self.bot)
         player = await mightpulse.fetch_player_data(gid, force_refresh=True)
         if not isinstance(player, dict):
@@ -349,13 +357,17 @@ class IdentityMightpulse(commands.Cog):
             await interaction.followup.send(f"{denial}.", ephemeral=True)
             return
         fields = roles.player_to_user_fields(gid, player)
-        storage.register_player(
+        registered = storage.register_player(
             fid=fields["fid"], discord_id=interaction.user.id,
             discord_server_id=interaction.guild_id, nickname=fields["nickname"],
             kid=fields["kid"], alliance_aid=fields["alliance_aid"],
             rank=fields["rank"], power=fields["power"],
             abbr=fields["abbr"], alliance_name=fields["alliance_name"],
+            reject_other_owner=True,
         )
+        if not registered:
+            await interaction.followup.send(ownership_denial, ephemeral=True)
+            return
         await sync_member(self.bot, interaction.user)
         await interaction.followup.send(f"Linked and synced ID `{gid}`.", ephemeral=True)
 
