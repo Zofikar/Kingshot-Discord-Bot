@@ -127,8 +127,17 @@ async def _reorder_alliance_roles(bot, guild):
     if not active:
         return
     active.sort(key=lambda x: x["power"], reverse=True)
-    start = max(top_anchor.position - 1, len(active) - 1)
-    payload = {item["role"]: start - i for i, item in enumerate(active)}
+    # Positions are bottom-up. Remove the alliance block before locating the
+    # anchor: moving roles from above it changes the anchor's final position.
+    alliance_roles = list(dict.fromkeys(
+        item["role"] for item in active if item["role"] != top_anchor))
+    ordered = [role for role in guild.roles if role not in alliance_roles]
+    anchor_index = ordered.index(top_anchor)
+    ordered[anchor_index:anchor_index] = reversed(alliance_roles)
+    payload = {role: position for position, role in enumerate(ordered)
+               if role.position != position}
+    if not payload:
+        return
     try:
         await guild.edit_role_positions(positions=payload)
     except (discord.Forbidden, discord.HTTPException) as e:
@@ -176,6 +185,16 @@ class IdentityBase(commands.Cog):
 
     def __init__(self, bot):
         self.bot = bot
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        for guild in self.bot.guilds:
+            await _reorder_alliance_roles(self.bot, guild)
+
+    @commands.Cog.listener()
+    async def on_guild_role_update(self, before, after):
+        if before.position != after.position:
+            await _reorder_alliance_roles(self.bot, after.guild)
 
     async def _resolve_fids(self, interaction, fids_text):
         """Given FIDs or all of the caller's; returns list or None (after replying)."""
