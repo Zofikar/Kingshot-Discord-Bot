@@ -1287,6 +1287,9 @@ if __name__ == "__main__":
             await super().on_command_error(ctx, error)
 
     intents = discord.Intents.default()
+    # Required for complete member caches and safe diplomat reconciliation.
+    # The Server Members Intent must also be enabled in the Developer Portal.
+    intents.members = True
     intents.message_content = True
 
     bot = CustomBot(command_prefix="/", intents=intents)
