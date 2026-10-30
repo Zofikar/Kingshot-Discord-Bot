@@ -68,11 +68,13 @@ async def setup(bot):
     from .cogs.id_channel import IDChannel
     from .cogs.nap_breaking import NapBreaking
     from .tasks.nightly import NightlyTasks
+    from .cogs.council import Council
     await bot.add_cog(Settings(bot))
     await bot.add_cog(Nap(bot))
     await bot.add_cog(IDChannel(bot))
     await bot.add_cog(NapBreaking(bot))
     await bot.add_cog(NightlyTasks(bot))
+    await bot.add_cog(Council(bot))
 
     logger.info(
         "extension loaded (MightPulse %s)",

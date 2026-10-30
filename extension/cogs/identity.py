@@ -33,8 +33,12 @@ def _settings(bot) -> SettingsStore:
 
 
 def _top_aids(bot) -> set:
-    n = _settings(bot).get_int("council_top_alliances_count", 20)
-    return {str(aid) for aid in storage.top_alliances_by_power(n)}
+    snapshot = storage.latest_nap_snapshot()
+    if snapshot:
+        return {str(row["aid"]) for row in snapshot}
+    from .nap import _nap_context
+    logic, _ = _nap_context(bot)
+    return {str(row["aid"]) for row in logic.get_nap_protection_snapshot()}
 
 
 def _alliance_row(bot, aid):
@@ -152,6 +156,9 @@ async def sync_member(bot, member) -> None:
     if fid is None:
         # No linked accounts: strip every extension-managed role.
         await _apply(bot, member, member.nick or member.display_name, [], _managed_role_ids(bot))
+        council = getattr(bot, "get_cog", lambda name: None)("Council")
+        if council is not None:
+            await council.reconcile(member.guild)
         return
 
     row = storage.user_row(fid)
@@ -174,6 +181,9 @@ async def sync_member(bot, member) -> None:
         if other_role_id != alliance_role_id and other_role_id not in remove:
             remove.append(other_role_id)
     await _apply(bot, member, nick, add, remove)
+    council = getattr(bot, "get_cog", lambda name: None)("Council")
+    if council is not None:
+        await council.reconcile(member.guild)
 
 
 def _owned_fids(caller_id: int) -> list:

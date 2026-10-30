@@ -120,15 +120,35 @@ def seed_from_config(store: SettingsStore, config) -> list:
         "role_r5_id": _s(config.role_r5_id),
         "role_r4_id": _s(config.role_r4_id),
         "role_council_id": _s(config.role_council_id),
+        "role_diplomat_id": _s(config.role_diplomat_id),
+        "vote_channel_id": _s(config.vote_channel_id),
+        "vote_result_announcement_channel": _s(config.vote_result_announcement_channel),
+        "vote_approval_notification_channel_id": _s(config.vote_approval_notification_channel_id),
+        "vote_approval_notification_role_id": _s(config.vote_approval_notification_role_id),
         "nap_channel_id": _s(config.nap_channel_id),
         "leaders_nap_post_channel": _s(config.leaders_nap_post_channel),
         "unified_id_channel_id": _s(config.unified_id_channel_id),
         "whitelist_kids": json.dumps(whitelist_kids),
         "whitelist_alliances": json.dumps([]),
-        "council_top_alliances_count": str(config.council_top_alliances_count),
         "nap_alliances_count": str(config.nap_alliances_count),
         "nap_candidate_multiplier": str(config.nap_candidate_multiplier),
         "nap_snapshot_lookback_protected": str(config.nap_snapshot_lookback_protected),
     }
+    # Rename notification settings before seeding so existing installations keep
+    # their destinations. Explicit values under the new names take precedence.
+    with store._connect() as conn:
+        store._ensure_table(conn)
+        for suffix in ("channel_id", "role_id"):
+            old = PREFIX + "vote_admin_" + suffix
+            new = PREFIX + "vote_approval_notification_" + suffix
+            conn.execute(
+                f"INSERT OR IGNORE INTO {TABLE} (setting_key, setting_value) "
+                f"SELECT ?, setting_value FROM {TABLE} WHERE setting_key=?",
+                (new, old),
+            )
+            conn.execute(f"DELETE FROM {TABLE} WHERE setting_key=?", (old,))
     store.seed(mapping)
+    with store._connect() as conn:
+        conn.execute(f"DELETE FROM {TABLE} WHERE setting_key=?",
+                     (PREFIX + "council_top_alliances_count",))
     return list(mapping)

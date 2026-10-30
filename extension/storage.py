@@ -572,6 +572,17 @@ def record_nap_ranking(ranked, *, posted_at=None, db_dir="db"):
                 )
 
 
+def latest_nap_snapshot(*, db_dir="db"):
+    """Latest complete posted electorate, never the lookback protection union."""
+    ensure_schema(db_dir)
+    with _connect(os.path.join(db_dir, VERIFICATION_FILE)) as conn:
+        rows = conn.execute(
+            "SELECT aid,abbr FROM nap_ranking_history WHERE posted_at="
+            "(SELECT posted_at FROM nap_ranking_history ORDER BY id DESC LIMIT 1) "
+            "ORDER BY id").fetchall()
+    return [{"aid": int(aid), "abbr": abbr} for aid, abbr in rows]
+
+
 def nap_lookback_protected(days, *, db_dir="db"):
     """Merged lookback entries (aid, abbr, name, power, last_seen_utc) within `days`."""
     if days <= 0:

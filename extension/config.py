@@ -53,6 +53,11 @@ class Config:
     role_r5_id: Optional[int] = None
     role_r4_id: Optional[int] = None
     role_council_id: Optional[int] = None
+    role_diplomat_id: Optional[int] = None
+    vote_channel_id: Optional[int] = None
+    vote_result_announcement_channel: Optional[int] = None
+    vote_approval_notification_channel_id: Optional[int] = None
+    vote_approval_notification_role_id: Optional[int] = None
     nap_channel_id: Optional[int] = None
     leaders_nap_post_channel: Optional[int] = None
     unified_id_channel_id: Optional[int] = None
@@ -61,7 +66,6 @@ class Config:
     allowed_kingdom_id: Optional[int] = None
 
     # NAP / council tunables.
-    council_top_alliances_count: int = 20
     nap_alliances_count: int = 10
     nap_candidate_multiplier: float = 2.0
     nap_snapshot_lookback_protected: int = 0
@@ -85,11 +89,15 @@ def load_config() -> Config:
         role_r5_id=_int("ROLE_R5_ID"),
         role_r4_id=_int("ROLE_R4_ID"),
         role_council_id=_int("ROLE_COUNCIL_ID"),
+        role_diplomat_id=_int("ROLE_DIPLOMAT_ID"),
+        vote_channel_id=_int("VOTE_CHANNEL_ID"),
+        vote_result_announcement_channel=_int("VOTE_RESULT_ANNOUNCEMENT_CHANNEL"),
+        vote_approval_notification_channel_id=_int("VOTE_APPROVAL_NOTIFICATION_CHANNEL_ID"),
+        vote_approval_notification_role_id=_int("VOTE_APPROVAL_NOTIFICATION_ROLE_ID"),
         nap_channel_id=_int("NAP_CHANNEL_ID"),
         leaders_nap_post_channel=_int("LEADERS_NAP_POST_CHANNEL"),
         unified_id_channel_id=_int("UNIFIED_ID_CHANNEL_ID"),
         allowed_kingdom_id=_int("ALLOWED_KINGDOM_ID"),
-        council_top_alliances_count=_int("COUNCIL_TOP_ALLIANCES_COUNT", 20),
         nap_alliances_count=_int("NAP_ALLIANCES_COUNT", 10),
         nap_candidate_multiplier=_float("NAP_CANDIDATE_MULTIPLIER", 2.0),
         nap_snapshot_lookback_protected=max(0, _int("NAP_SNAPSHOT_LOOKBACK_PROTECTED", 0)),
