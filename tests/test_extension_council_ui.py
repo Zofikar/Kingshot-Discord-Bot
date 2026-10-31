@@ -41,6 +41,90 @@ def test_reconcile_populates_cache_before_deciding_departures(council):
     assert len(cog.mandates.history(1)) == 1
 
 
+@pytest.mark.parametrize("role,override,expected", [
+    ("leader", None, "leader"),
+    ("diplomat", None, "handover"),
+    ("unverified_diplomat", None, "handover"),
+    ("admin", 7, "admin"),
+    ("admin", None, None),
+    ("leader", 7, None),
+    ("outsider", None, None),
+    ("wrong_recipient", None, None),
+])
+def test_diplomat_assign_infers_alliance(council, monkeypatch, role, override, expected):
+    from extension.cogs.council import PermissionManager
+    cog, _, guild = council
+    cog.reconcile = AsyncMock()
+    cog.electorate = lambda guild_id: [{"aid": 7}]
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (role == "admin",))
+    if role in ("diplomat", "unverified_diplomat", "wrong_recipient"):
+        cog.mandates.assign(1, 7, 42, 99, "admin")
+
+    def player(member_id):
+        if role in ("admin", "unverified_diplomat") and member_id == 42:
+            raise ValueError("A verified MAIN FID is required.")
+        return {"rank": 5 if role == "leader" else 3,
+                "alliance": 7 if role == "leader" or (member_id == 43 and role != "wrong_recipient") else 8}
+
+    cog.main_player = player
+    interaction = SimpleNamespace(guild_id=1, guild=guild, user=SimpleNamespace(id=42),
+                                 response=SimpleNamespace(defer=AsyncMock()),
+                                 followup=SimpleNamespace(send=AsyncMock()))
+    member = SimpleNamespace(id=43, mention="<@43>")
+    asyncio.run(cog.diplomat_assign.callback(cog, interaction, member, override))
+    if expected:
+        assert cog.mandates.assignments(1) == {7: 43}
+        assert cog.mandates.history(1)[-1]["action"] == expected
+    else:
+        assert 43 not in cog.mandates.assignments(1).values()
+        assert "now represents" not in interaction.followup.send.await_args.args[0]
+
+
+def test_diplomat_assign_alliance_option_is_optional():
+    from extension.cogs.council import Council
+    options = {option.name: option for option in Council.diplomat_assign.parameters}
+    assert options["member"].required
+    assert not options["alliance_id"].required
+    assert options["alliance_id"].autocomplete
+
+
+@pytest.mark.parametrize("query,expected", [("", [7, 82]), ("mayhem", [7]),
+                                          ("bbq", [7]), ("82", [82]), ("missing", [])])
+def test_diplomat_alliance_autocomplete_search(council, monkeypatch, query, expected):
+    from extension.cogs.council import PermissionManager
+    cog, _, _ = council
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (True,))
+    storage.upsert_alliance(7, name="MAYHEM", abbr="BBQ")
+    storage.upsert_alliance(99, name="Ineligible", abbr="NO")
+    cog.electorate = lambda guild_id: [{"aid": 7, "abbr": "BBQ"}, {"aid": 82, "abbr": "ALT"}]
+    interaction = SimpleNamespace(guild_id=1, user=SimpleNamespace(id=42))
+    choices = asyncio.run(cog.diplomat_alliance_autocomplete(interaction, query))
+    assert [choice.value for choice in choices] == expected
+    if 7 in expected:
+        assert choices[0].name == "BBQ · MAYHEM (ID: 7)"
+
+
+def test_diplomat_alliance_autocomplete_limits(council, monkeypatch):
+    from extension.cogs.council import PermissionManager
+    cog, _, _ = council
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (True,))
+    cog.electorate = lambda guild_id: [{"aid": aid, "abbr": "X" * 120} for aid in range(30)]
+    interaction = SimpleNamespace(guild_id=1, user=SimpleNamespace(id=42))
+    choices = asyncio.run(cog.diplomat_alliance_autocomplete(interaction, ""))
+    assert len(choices) == 25
+    assert all(len(choice.name) <= 100 for choice in choices)
+    assert choices[0].name.endswith(" (ID: 0)")
+
+
+@pytest.mark.parametrize("guild_id,admin", [(None, True), (1, False)])
+def test_diplomat_alliance_autocomplete_access(council, monkeypatch, guild_id, admin):
+    from extension.cogs.council import PermissionManager
+    cog, _, _ = council
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (admin,))
+    interaction = SimpleNamespace(guild_id=guild_id, user=SimpleNamespace(id=42))
+    assert asyncio.run(cog.diplomat_alliance_autocomplete(interaction, "")) == []
+
+
 def test_incomplete_chunk_cannot_delete_mandates(council):
     cog, _, guild = council
     cog.mandates.assign(1, 7, 42, 99, "admin")

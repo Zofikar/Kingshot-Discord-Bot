@@ -344,16 +344,33 @@ class Council(commands.Cog):
 
     @app_commands.command(name="diplomat_assign", description="Appoint a Discord member as an alliance diplomat.")
     @app_commands.guild_only()
-    async def diplomat_assign(self, interaction: discord.Interaction, alliance_id: int, member: discord.Member):
+    @app_commands.describe(alliance_id="Optional alliance override for admins; otherwise inferred from your R5 seat or mandate.")
+    async def diplomat_assign(self, interaction: discord.Interaction, member: discord.Member,
+                              alliance_id: int | None = None):
         await interaction.response.defer(ephemeral=True)
         try:
             async with self.lock:
                 await self.reconcile(interaction.guild)
+                admin = PermissionManager.is_admin(interaction.user.id)[0]
+                player = None
+                try:
+                    player = self.main_player(interaction.user.id)
+                except ValueError:
+                    # Explicit appointments and existing mandates do not require a linked MAIN.
+                    pass
+                if alliance_id is None:
+                    if player and player["rank"] == 5 and player["alliance"] is not None:
+                        alliance_id = int(player["alliance"])
+                    else:
+                        alliance_id = next((aid for aid, actor in self.mandates.active(
+                            interaction.guild_id).items() if actor == interaction.user.id), None)
+                    if alliance_id is None:
+                        raise ValueError("No R5 alliance or active diplomatic mandate found. Admins must provide alliance_id.")
+                elif not admin:
+                    raise ValueError("Only admins may provide alliance_id; omit it to use your own alliance.")
                 if alliance_id not in {r["aid"] for r in self.electorate(interaction.guild_id)}:
                     raise ValueError("This alliance is not currently eligible.")
-                admin = PermissionManager.is_admin(interaction.user.id)[0]
                 current = self.mandates.active(interaction.guild_id).get(alliance_id)
-                player = None if admin else self.main_player(interaction.user.id)
                 leader = player and player["rank"] == 5 and str(player["alliance"]) == str(alliance_id)
                 if not admin and not leader:
                     if current != interaction.user.id:
@@ -367,6 +384,30 @@ class Council(commands.Cog):
             await interaction.followup.send(f"{member.mention} now represents alliance {alliance_id}.", ephemeral=True)
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
+
+    @diplomat_assign.autocomplete("alliance_id")
+    async def diplomat_alliance_autocomplete(self, interaction: discord.Interaction, current: str):
+        if not interaction.guild_id or not PermissionManager.is_admin(interaction.user.id)[0]:
+            return []
+
+        def choices():
+            query = current.strip().casefold()
+            results = []
+            for seat in self.electorate(interaction.guild_id):
+                aid = int(seat["aid"])
+                alliance = storage.alliance_row(aid)
+                name = alliance["name"] if alliance else None
+                tag = seat.get("abbr") or (alliance["abbr"] if alliance else None)
+                label = " · ".join(str(part) for part in (tag, name) if part) or "Alliance"
+                if query not in f"{label} {aid}".casefold():
+                    continue
+                suffix = f" (ID: {aid})"
+                results.append(app_commands.Choice(name=label[:100 - len(suffix)] + suffix, value=aid))
+                if len(results) == 25:
+                    break
+            return results
+
+        return await asyncio.to_thread(choices)
 
     @app_commands.command(name="diplomat_claim", description="R5: override your seat; R4: claim a vacant leader-absent seat.")
     @app_commands.guild_only()
