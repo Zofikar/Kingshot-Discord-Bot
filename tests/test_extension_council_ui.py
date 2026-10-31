@@ -25,6 +25,96 @@ def council(tmp_path, monkeypatch):
     return cog, store, guild
 
 
+def report_interaction(guild):
+    return SimpleNamespace(guild_id=guild.id, guild=guild, user=SimpleNamespace(id=99),
+                           response=SimpleNamespace(defer=AsyncMock()),
+                           followup=SimpleNamespace(send=AsyncMock()))
+
+
+def database_snapshot(store):
+    import sqlite3
+    with sqlite3.connect(store.path) as conn:
+        return list(conn.iterdump())
+
+
+def test_diplomat_list_is_private_and_read_only(council):
+    cog, store, guild = council
+    vote = store.submit(1, "Existing vote", 7, 100, 42, now=1)
+    store.open_next(1, [{"aid": 7, "abbr": "BBQ"}, {"aid": 8, "abbr": "ALT"}], now=2)
+    cog.mandates.assign(1, 7, 42, 99, "admin")
+    cog.mandates.assign(2, 8, 55, 99, "admin")
+    before = database_snapshot(store)
+    interaction = report_interaction(guild)
+    asyncio.run(cog.diplomat_list.callback(cog, interaction))
+    sent = interaction.followup.send.await_args
+    assert "BBQ (7) — <@42>" in sent.args[0]
+    assert "ALT (8) — Vacant" in sent.args[0]
+    assert "55" not in sent.args[0]
+    assert sent.kwargs["ephemeral"]
+    assert database_snapshot(store) == before
+    assert store.get(vote)["status"] == "OPEN"
+
+
+@pytest.mark.parametrize("finalized", [False, True])
+def test_vote_audit_preserves_existing_votes(council, monkeypatch, finalized):
+    from extension.cogs.council import PermissionManager
+    cog, store, guild = council
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (True,))
+    vote = store.submit(1, "Existing vote", 7, 100, 42, now=1)
+    store.open_next(1, [{"aid": 7, "abbr": "BBQ"}, {"aid": 8, "abbr": "ALT"}], now=2)
+    store.cast(vote, 7, "NO", 0, 42, now=3)
+    store.cast(vote, 7, "YES", 123, 99, now=4, manual=True, reason="Confirmed in game")
+    if finalized:
+        store.conclude(vote, 99, now=90000)
+    before = database_snapshot(store)
+    interaction = report_interaction(guild)
+    asyncio.run(cog.vote_audit.callback(cog, interaction, vote))
+    sent = interaction.followup.send.await_args
+    text = sent.args[0]
+    assert "Voter <@42>" in text
+    assert "FID: none linked" in text
+    assert "Entered by admin <@99>" in text
+    assert "FID: 123" in text
+    assert "replaces NO" in text
+    assert "Confirmed in game" in text
+    assert "ALT (8) — DID_NOT_VOTE" in text
+    assert sent.kwargs["ephemeral"]
+    assert database_snapshot(store) == before
+
+
+@pytest.mark.parametrize("admin,guild_id,error", [
+    (False, 1, "admin permission"), (True, 2, "another server"),
+])
+def test_vote_audit_rejects_unauthorized_access(council, monkeypatch, admin, guild_id, error):
+    from extension.cogs.council import PermissionManager
+    cog, store, guild = council
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (admin,))
+    vote = store.submit(guild_id, "Secret question", 7, 100, 42)
+    interaction = report_interaction(guild)
+    asyncio.run(cog.vote_audit.callback(cog, interaction, vote))
+    text = interaction.followup.send.await_args.args[0]
+    assert error in text
+    assert "Secret question" not in text
+
+
+def test_vote_audit_attaches_complete_long_history(council, monkeypatch):
+    from extension.cogs.council import PermissionManager
+    cog, store, guild = council
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (True,))
+    vote = store.submit(1, "Question", 7, 100, 42, now=1)
+    store.open_next(1, [{"aid": 7, "abbr": "BBQ"}], now=2)
+    for index in range(25):
+        store.cast(vote, 7, "YES", 100, 42, now=3 + index)
+    before = database_snapshot(store)
+    interaction = report_interaction(guild)
+    asyncio.run(cog.vote_audit.callback(cog, interaction, vote))
+    options = interaction.followup.send.await_args.kwargs
+    text = options["file"].fp.getvalue().decode("utf-8")
+    assert "#1 BBQ" in text and "#25 BBQ" in text
+    assert options["ephemeral"]
+    assert database_snapshot(store) == before
+
+
 def test_reconcile_populates_cache_before_deciding_departures(council):
     cog, _, guild = council
     cog.mandates.assign(1, 7, 42, 99, "admin")

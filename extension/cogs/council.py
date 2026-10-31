@@ -1,5 +1,6 @@
 """Council mandates, queued proposals, persistent private-feedback voting UI."""
 import asyncio
+import io
 import json
 import logging
 import time
@@ -341,6 +342,70 @@ class Council(commands.Cog):
                             await self.publish_and_advance(vote, guild)
                 except (ValueError, discord.HTTPException):
                     logger.exception("Council maintenance failed for guild %s", guild.id)
+
+    async def send_private_report(self, interaction, text, filename):
+        options = {"ephemeral": True, "allowed_mentions": discord.AllowedMentions.none()}
+        if len(text) <= 2000:
+            await interaction.followup.send(text, **options)
+        else:
+            await interaction.followup.send("Complete report attached.",
+                file=discord.File(io.BytesIO(text.encode("utf-8")), filename=filename), **options)
+
+    @app_commands.command(name="diplomat_list", description="List eligible alliance seats and their current diplomats.")
+    @app_commands.guild_only()
+    async def diplomat_list(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        seats = self.electorate(interaction.guild_id)
+        active = self.mandates.active(interaction.guild_id)
+        lines = ["## Current diplomats", "Stored active mandates (updated by normal reconciliation)."]
+        for seat in seats:
+            aid = seat["aid"]
+            member = active.get(aid)
+            representative = f"<@{member}> (Discord ID: {member})" if member else "Vacant"
+            lines.append(f"- {safe(seat['abbr'])} ({aid}) — {representative}")
+        if not seats:
+            lines.append("No eligible alliance seats.")
+        await self.send_private_report(interaction, "\n".join(lines), "diplomats.txt")
+
+    @app_commands.command(name="vote_audit", description="Admin: view ballot identities and complete replacement history.")
+    @app_commands.guild_only()
+    async def vote_audit(self, interaction: discord.Interaction, vote_id: int):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            self.require_admin(interaction)
+            vote = self.vote_for(interaction, vote_id)
+            rows = self.store.audit(vote_id)
+            seats = json.loads(vote["electorate"] or "[]")
+            tags = {seat["aid"]: seat["abbr"] for seat in seats}
+            latest = {row["alliance_id"]: row for row in rows}
+
+            def describe(row):
+                identity = (f"Entered by admin <@{row['actor']}>" if row["manual"] else
+                            f"Voter <@{row['actor']}>")
+                fid = str(row["fid"]) if row["fid"] else "none linked"
+                return (f"{row['answer']} — {identity} (Discord ID: {row['actor']})"
+                        f" — FID: {fid} — {utc(row['recorded_at'])}")
+
+            lines = [f"## Vote #{vote_id}: {safe(vote['title'])}",
+                     f"Status: {vote['status']}", "", "### Latest ballots"]
+            for seat in seats:
+                row = latest.get(seat["aid"])
+                lines.append(f"- {safe(seat['abbr'])} ({seat['aid']}) — " +
+                             (describe(row) if row else "DID_NOT_VOTE"))
+            if not seats:
+                lines.append("No electorate recorded; this proposal has not opened.")
+            lines += ["", "### Full ballot history (oldest first)",
+                      "Manual ballot FIDs identify the in-game voter; the Discord actor is the recording admin."]
+            for row in rows:
+                aid = row["alliance_id"]
+                lines.append(f"- #{row['id']} {safe(tags.get(aid, str(aid)))} ({aid}) — {describe(row)}"
+                             + (f" — replaces {row['previous_answer']}" if row["previous_answer"] else "")
+                             + (f" — Reason: {safe(row['reason'])}" if row["manual"] else ""))
+            if not rows:
+                lines.append("No ballots recorded.")
+            await self.send_private_report(interaction, "\n".join(lines), f"vote-{vote_id}-audit.txt")
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
 
     @app_commands.command(name="diplomat_assign", description="Appoint a Discord member as an alliance diplomat.")
     @app_commands.guild_only()
