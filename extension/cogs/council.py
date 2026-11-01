@@ -595,6 +595,8 @@ class Council(commands.Cog):
     @app_commands.command(name="vote_manual", description="Admin: record an in-game ballot or correction with voting FID and reason.")
     @app_commands.guild_only()
     @app_commands.choices(answer=ANSWERS)
+    @app_commands.describe(vote_id="Select an open vote or one awaiting approval by title or ID",
+                           alliance_id="Select an alliance from the selected vote's electorate by tag or ID")
     async def vote_manual(self, interaction: discord.Interaction, vote_id: int, alliance_id: int,
                           answer: str, fid: str, reason: str):
         await interaction.response.defer(ephemeral=True)
@@ -611,6 +613,56 @@ class Council(commands.Cog):
                 f"Reason: {safe(reason)}\n{utc(time.time())}", ephemeral=True)
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
+
+    @vote_manual.autocomplete("vote_id")
+    async def manual_vote_autocomplete(self, interaction: discord.Interaction, current: str):
+        if not interaction.guild_id or not PermissionManager.is_admin(interaction.user.id)[0]:
+            return []
+
+        def choices():
+            query = current.strip().casefold()
+            results = []
+            for vote in self.store.list_votes(interaction.guild_id):
+                if vote["status"] not in ("OPEN", "AWAITS_APPROVAL"):
+                    continue
+                label = f"#{vote['id']} · {vote['title']}"
+                if query in label.casefold():
+                    results.append(app_commands.Choice(name=label[:100], value=vote["id"]))
+                if len(results) == 25:
+                    break
+            return results
+
+        return await asyncio.to_thread(choices)
+
+    @vote_manual.autocomplete("alliance_id")
+    async def manual_alliance_autocomplete(self, interaction: discord.Interaction, current: str):
+        if not interaction.guild_id or not PermissionManager.is_admin(interaction.user.id)[0]:
+            return []
+        vote_id = getattr(interaction.namespace, "vote_id", None)
+        if vote_id is None:
+            return []
+
+        def choices():
+            try:
+                vote = self.store.get(vote_id)
+            except ValueError:
+                return []
+            if vote["guild_id"] != interaction.guild_id or vote["status"] not in ("OPEN", "AWAITS_APPROVAL"):
+                return []
+            query = current.strip().casefold()
+            results = []
+            for seat in json.loads(vote["electorate"]):
+                aid = int(seat["aid"])
+                tag = seat.get("abbr") or "Alliance"
+                if query not in f"{tag} {aid}".casefold():
+                    continue
+                suffix = f" (ID: {aid})"
+                results.append(app_commands.Choice(name=tag[:100 - len(suffix)] + suffix, value=aid))
+                if len(results) == 25:
+                    break
+            return results
+
+        return await asyncio.to_thread(choices)
 
     @app_commands.command(name="vote_conclude", description="Admin: preview and confirm the pending vote result.")
     @app_commands.guild_only()

@@ -31,6 +31,34 @@ def report_interaction(guild):
                            followup=SimpleNamespace(send=AsyncMock()))
 
 
+def test_manual_vote_id_hints(council, monkeypatch):
+    from extension.cogs.council import PermissionManager
+    cog, store, guild = council
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (True,))
+    vote = store.submit(1, "Council question", 7, 100, 42)
+    store.open_next(1, [{"aid": 7, "abbr": "BBQ"}, {"aid": 82, "abbr": "ALT"}])
+    store.submit(1, "Queued question", 7, 100, 42)
+    store.submit(2, "Other server", 7, 100, 42)
+    interaction = report_interaction(guild)
+    interaction.namespace = SimpleNamespace(vote_id=vote)
+    choices = asyncio.run(cog.manual_vote_autocomplete(interaction, "question"))
+    assert [(choice.name, choice.value) for choice in choices] == [(f"#{vote} · Council question", vote)]
+    choices = asyncio.run(cog.manual_alliance_autocomplete(interaction, "bbq"))
+    assert [(choice.name, choice.value) for choice in choices] == [("BBQ (ID: 7)", 7)]
+    assert asyncio.run(cog.manual_alliance_autocomplete(interaction, "missing")) == []
+    parameters = {parameter.name: parameter for parameter in cog.vote_manual.parameters}
+    for name in ("vote_id", "alliance_id"):
+        assert parameters[name].autocomplete
+        assert parameters[name].description != "…"
+    interaction.guild_id = 2
+    assert asyncio.run(cog.manual_alliance_autocomplete(interaction, "")) == []
+    interaction.namespace.vote_id = None
+    assert asyncio.run(cog.manual_alliance_autocomplete(interaction, "")) == []
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (False,))
+    assert asyncio.run(cog.manual_vote_autocomplete(interaction, "")) == []
+    assert asyncio.run(cog.manual_alliance_autocomplete(interaction, "")) == []
+
+
 def database_snapshot(store):
     import sqlite3
     with sqlite3.connect(store.path) as conn:
