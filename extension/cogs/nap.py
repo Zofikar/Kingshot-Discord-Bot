@@ -61,6 +61,39 @@ async def _resolve_aid_from_gid(gid):
     return int(aid)
 
 
+async def _resolve_academy_tag(logic, main_aid, tag):
+    """Resolve a current academy tag only within the main alliance's kingdom."""
+    main = storage.alliance_row(main_aid)
+    kid = main["kid"] if main else None
+    if not kid:
+        return "Your main alliance's kingdom is unknown; use the GID-based admin command."
+    kid = int(kid)
+    tag = tag.strip()
+    if not tag:
+        return "Academy tag cannot be blank. Omit it to remove the academy."
+    candidates = [row for row in storage.all_alliances()
+                  if row["kid"] is not None and int(row["kid"]) == kid
+                  and str(row["abbr"] or "").strip().casefold() == tag.casefold()]
+    exact = [row for row in candidates if str(row["abbr"]).strip() == tag]
+    matches = exact or candidates
+    if len(matches) == 1:
+        row = dict(matches[0])
+        aid = int(row["alliance_id"])
+    else:
+        fetched = await mightpulse.fetch_alliance_data(kid, tag, bypass_local_cache=True)
+        if not isinstance(fetched, dict) or not fetched.get("aid"):
+            return f"Could not resolve academy tag `{tag}` in kingdom `{kid}`."
+        if fetched.get("kid") is not None and int(fetched["kid"]) != kid:
+            return f"Academy tag `{tag}` did not resolve to kingdom `{kid}`."
+        aid = int(fetched["aid"])
+        row = {"abbr": fetched.get("abbr") or tag, "name": fetched.get("name"),
+               "kid": kid, "power": fetched.get("power")}
+        storage.upsert_alliance(aid, **row)
+    # Keep this command's snapshot current, including tags used by NAP output.
+    logic.alliances[str(aid)] = row
+    return aid
+
+
 async def post_nap_ranking(bot, *, triggered_by="scheduler"):
     """Post the NAP ranking (+ lookback footer) and the leaders tag list. Returns bool."""
     # Wait for any in-progress nightly maintenance so the posted snapshot always
@@ -218,9 +251,9 @@ class Nap(commands.Cog):
             await interaction.followup.send("Your account has no alliance.", ephemeral=True)
             return
         logic, nap_state = _nap_context(self.bot)
-        ac_aid = logic._resolve_aid_for_tag(academy_tag) if academy_tag else None
-        if academy_tag and ac_aid is None:
-            await interaction.followup.send(f"Could not resolve tag `{academy_tag}`.", ephemeral=True)
+        ac_aid = await _resolve_academy_tag(logic, main_aid, academy_tag) if academy_tag is not None else None
+        if isinstance(ac_aid, str):
+            await interaction.followup.send(ac_aid, ephemeral=True)
             return
         if logic.set_alliance_academy(main_aid, ac_aid):
             _save_nap(logic, nap_state)
@@ -241,22 +274,12 @@ class Nap(commands.Cog):
             await interaction.followup.send(f"Unknown alliance tag `{main_tag}`.", ephemeral=True)
             return
         academy_aid = None
-        if academy_tag:
-            academy_aid = logic._resolve_aid_for_tag(academy_tag, exact_only=True)
-            if academy_aid is None:
-                kids = _settings(self.bot).get_json("whitelist_kids", [])
-                if kids:
-                    fetched = await mightpulse.fetch_alliance_data(int(kids[0]), academy_tag,
-                                                                  bypass_local_cache=True)
-                    if isinstance(fetched, dict) and fetched.get("aid"):
-                        storage.upsert_alliance(int(fetched["aid"]), abbr=fetched.get("abbr"),
-                                                name=fetched.get("name"), kid=fetched.get("kid"),
-                                                power=fetched.get("power"))
-                        academy_aid = int(fetched["aid"])
-            if academy_aid is None:
-                await interaction.followup.send(f"Could not resolve academy tag `{academy_tag}`.", ephemeral=True)
+        if academy_tag is not None:
+            academy_aid = await _resolve_academy_tag(logic, main_aid, academy_tag)
+            if isinstance(academy_aid, str):
+                await interaction.followup.send(academy_aid, ephemeral=True)
                 return
-        if logic.set_alliance_academy(main_aid, academy_aid, academy_tag=academy_tag):
+        if logic.set_alliance_academy(main_aid, academy_aid):
             _save_nap(logic, nap_state)
             await interaction.followup.send("Academy updated.", ephemeral=True)
         else:
