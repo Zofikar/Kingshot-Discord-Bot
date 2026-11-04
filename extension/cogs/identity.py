@@ -7,7 +7,9 @@ plus /refresh. The extension entrypoint wires both and removes the upstream
 commands they replace.
 """
 
+import asyncio
 import logging
+import re
 
 import discord
 from discord import app_commands
@@ -20,6 +22,69 @@ from ..providers import mightpulse
 from ..settings import SettingsStore
 
 logger = logging.getLogger("extension")
+
+
+async def _account_choices(owner_id, current: str, *, multiple=False):
+    """Suggest only the owner's linked accounts; keep earlier list selections."""
+    prefix = ""
+    query = current.strip()
+    selected = set()
+    if multiple:
+        parts = re.split(r"[,\s]+", current)
+        query = parts[-1]
+        previous = [part for part in parts[:-1] if part]
+        if any(not part.isdigit() for part in previous):
+            return []
+        selected = {int(part) for part in previous}
+        prefix = ", ".join(previous)
+        if prefix:
+            prefix += ", "
+
+    def read():
+        choices = []
+        for fid, is_main in storage.fids_for_discord(owner_id):
+            if int(fid) in selected:
+                continue
+            row = storage.user_row(fid)
+            name = (row["nickname"] if row else None) or "Unnamed"
+            suffix = f" ({fid})" + (" · main" if is_main else "")
+            if query.casefold() not in f"{name} {fid}".casefold():
+                continue
+            value = prefix + str(fid) if multiple else int(fid)
+            if multiple and len(value) > 100:
+                continue
+            choices.append(app_commands.Choice(name=name[:100 - len(suffix)] + suffix, value=value))
+            if len(choices) == 25:
+                break
+        return choices
+
+    return await asyncio.to_thread(read)
+
+
+async def _own_account_autocomplete(interaction: discord.Interaction, current: str):
+    return await _account_choices(interaction.user.id, current)
+
+
+async def _own_accounts_autocomplete(interaction: discord.Interaction, current: str):
+    return await _account_choices(interaction.user.id, current, multiple=True)
+
+
+async def _member_account_autocomplete(interaction: discord.Interaction, current: str):
+    if not PermissionManager.is_admin(interaction.user.id)[0]:
+        return []
+    member = getattr(interaction.namespace, "member", None)
+    if member is None:
+        return []
+    return await _account_choices(member.id, current)
+
+
+async def _source_accounts_autocomplete(interaction: discord.Interaction, current: str):
+    if not PermissionManager.is_admin(interaction.user.id)[0]:
+        return []
+    member = getattr(interaction.namespace, "from_user", None)
+    if member is None:
+        return []
+    return await _account_choices(member.id, current, multiple=True)
 
 _LOOKUP_ERRORS = {
     "NOT_FOUND": "was not found on MightPulse",
@@ -219,6 +284,7 @@ class IdentityBase(commands.Cog):
 
     @app_commands.command(name="unregister", description="Unlink accounts (blank = all of yours).")
     @app_commands.describe(fids="Comma/space-separated FIDs; leave empty to unlink all")
+    @app_commands.autocomplete(fids=_own_accounts_autocomplete)
     async def unregister(self, interaction, fids: str | None = None):
         await interaction.response.defer(ephemeral=True)
         targets = await self._resolve_fids(interaction, fids)
@@ -236,6 +302,7 @@ class IdentityBase(commands.Cog):
     @app_commands.command(name="transfer", description="Move accounts to another user (blank = all).")
     @app_commands.describe(to="Discord member to receive the accounts",
                            fids="Comma/space-separated FIDs; leave empty for all")
+    @app_commands.autocomplete(fids=_own_accounts_autocomplete)
     async def transfer(self, interaction, to: discord.Member, fids: str | None = None):
         await interaction.response.defer(ephemeral=True)
         targets = await self._resolve_fids(interaction, fids)
@@ -256,6 +323,7 @@ class IdentityBase(commands.Cog):
 
     @app_commands.command(name="set_main_fid", description="Set which linked account drives your identity.")
     @app_commands.describe(fid="The FID to make primary")
+    @app_commands.autocomplete(fid=_own_account_autocomplete)
     async def set_main_fid(self, interaction, fid: int):
         await interaction.response.defer(ephemeral=True)
         if not storage.set_main_fid(interaction.user.id, fid):
@@ -303,6 +371,7 @@ class IdentityBase(commands.Cog):
         await interaction.followup.send(f"Unbound FID `{fid}`.", ephemeral=True)
 
     @app_commands.command(name="admin_transfer", description="Admin: move accounts between users.")
+    @app_commands.autocomplete(fids=_source_accounts_autocomplete)
     async def admin_transfer(self, interaction, from_user: discord.Member, to: discord.Member,
                              fids: str | None = None):
         await interaction.response.defer(ephemeral=True)
@@ -323,6 +392,7 @@ class IdentityBase(commands.Cog):
 
     @app_commands.command(name="admin_set_main", description="Admin: set a member's main account.")
     @app_commands.describe(member="The Discord member", fid="The FID to make primary")
+    @app_commands.autocomplete(fid=_member_account_autocomplete)
     async def admin_set_main(self, interaction, member: discord.Member, fid: int):
         await interaction.response.defer(ephemeral=True)
         if not PermissionManager.is_admin(interaction.user.id)[0]:

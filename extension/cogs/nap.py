@@ -1,4 +1,5 @@
 """NAP cog: exclusions, academies, protected list, ranking post."""
+import asyncio
 import logging
 
 import discord
@@ -170,7 +171,41 @@ class Nap(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
 
+    async def _exclusion_choices(self, interaction, current, *, excluded):
+        if not PermissionManager.is_admin(interaction.user.id)[0]:
+            return []
+
+        def read():
+            logic, _ = _nap_context(self.bot)
+            aids = logic.nap_exclusions if excluded else logic.alliances
+            query = current.strip().casefold()
+            choices = []
+            for aid in aids:
+                if not excluded and str(aid) in logic.nap_exclusions:
+                    continue
+                info = logic.alliances.get(str(aid)) or {}
+                record = logic.nap_exclusions.get(str(aid)) or {}
+                tag = info.get("abbr") or record.get("tag") or "Unknown alliance"
+                name = info.get("name") or ""
+                label = f"[{tag}] {name}".strip()
+                if query not in f"{label} {aid}".casefold():
+                    continue
+                suffix = f" (ID: {aid})"
+                choices.append(app_commands.Choice(name=label[:100 - len(suffix)] + suffix, value=int(aid)))
+                if len(choices) == 25:
+                    break
+            return choices
+
+        return await asyncio.to_thread(read)
+
+    async def exclude_aid_autocomplete(self, interaction: discord.Interaction, current: str):
+        return await self._exclusion_choices(interaction, current, excluded=False)
+
+    async def unexclude_aid_autocomplete(self, interaction: discord.Interaction, current: str):
+        return await self._exclusion_choices(interaction, current, excluded=True)
+
     @app_commands.command(name="nap_exclude", description="Admin: exclude an alliance from NAP.")
+    @app_commands.autocomplete(aid=exclude_aid_autocomplete)
     @app_commands.describe(aid="Alliance id", reason="Reason for exclusion")
     async def nap_exclude(self, interaction, aid: int, reason: str = "no reason given"):
         await interaction.response.defer(ephemeral=True)
@@ -185,6 +220,7 @@ class Nap(commands.Cog):
             await interaction.followup.send("That alliance is already excluded.", ephemeral=True)
 
     @app_commands.command(name="nap_unexclude", description="Admin: remove a NAP exclusion.")
+    @app_commands.autocomplete(aid=unexclude_aid_autocomplete)
     @app_commands.describe(aid="Alliance id")
     async def nap_unexclude(self, interaction, aid: int):
         await interaction.response.defer(ephemeral=True)
