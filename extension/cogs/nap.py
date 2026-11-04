@@ -96,7 +96,7 @@ async def _resolve_academy_tag(logic, main_aid, tag):
 
 
 async def post_nap_ranking(bot, *, triggered_by="scheduler"):
-    """Post the NAP ranking (+ lookback footer) and the leaders tag list. Returns bool."""
+    """Post the NAP ranking, lookback/exclusion notices and leaders tag list. Returns bool."""
     # Wait for any in-progress nightly maintenance so the posted snapshot always
     # reflects the completed persisted ranking state (mirrors the monolith's lock).
     async with bot.maintenance_lock:
@@ -131,6 +131,10 @@ async def post_nap_ranking(bot, *, triggered_by="scheduler"):
             if len(fallen) > 15:
                 footer += f" … and {len(fallen) - 15} more"
             message = message + "\n\n" + footer
+
+        exclusions = logic.get_nap_exclusion_lines()
+        if exclusions:
+            message += "\n\n" + "\n".join(exclusions)
 
         try:
             channel = bot.get_channel(channel_id)

@@ -7,8 +7,10 @@ These tests pin that behaviour down without touching the real ``db/`` directory.
 """
 import asyncio
 import types
+from datetime import datetime, timezone
 
 import discord
+import pytest
 
 from extension import nap as nap_mod
 from extension import storage
@@ -101,6 +103,32 @@ def test_post_ranking_records_snapshot(tmp_path, monkeypatch):
     assert len(channel.messages) == 1
     assert "1. [A10] N10 - 300" in channel.messages[0]
     # The posted snapshot is persisted, so a later lookback can protect it.
+    assert [e["aid"] for e in storage.nap_lookback_protected(7, db_dir=str(tmp_path))] == [10, 11]
+
+
+@pytest.mark.parametrize("days", [0, 7])
+def test_post_ranking_includes_exclusions_alongside_lookback(tmp_path, monkeypatch, days):
+    channel = _FakeChannel()
+    bot = _prepare(monkeypatch, tmp_path, channel=channel,
+                   settings={"nap_snapshot_lookback_protected": days})
+    logic = _logic()
+    reason = "Breaking rules in past(as LOR), vote to let them back in didn't happen"
+    logic.alliances["12"] = {"abbr": "POW", "name": "Excluded", "power": 999}
+    logic.set_nap_exclusion(12, reason=reason, added_by="1")
+    # Exclusions must remain visible even without a current alliance row.
+    logic.set_nap_exclusion(13, reason="Another reason", added_by="1", tag="OLD")
+    monkeypatch.setattr(nap_cog, "_nap_context", lambda bot: (logic, {}))
+    monkeypatch.setattr(nap_cog.storage, "nap_lookback_protected", lambda days: [
+        {"aid": 14, "abbr": "FALL", "name": "Fallen",
+         "last_seen_utc": datetime.now(timezone.utc)},
+    ] if days else [])
+
+    assert asyncio.run(nap_cog.post_nap_ranking(bot)) is True
+    message = channel.messages[0]
+    assert f"⛔ [POW] is not part of NAP because of {reason}" in message
+    assert "⛔ [OLD] is not part of NAP because of Another reason" in message
+    assert ("Still NAP-protected via 7-day lookback" in message) == bool(days)
+    assert "1. [A10]" in message
     assert [e["aid"] for e in storage.nap_lookback_protected(7, db_dir=str(tmp_path))] == [10, 11]
 
 
