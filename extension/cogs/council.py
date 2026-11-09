@@ -15,7 +15,7 @@ from .. import storage
 from ..council import MandateStore
 from ..settings import SettingsStore
 from ..vote_storage import VoteStore
-from ..voting import tally
+from ..voting import parse_ranking
 
 logger = logging.getLogger("extension")
 ANSWERS = [app_commands.Choice(name="Yes", value="YES"),
@@ -31,16 +31,216 @@ def safe(text):
     return discord.utils.escape_mentions(discord.utils.escape_markdown(str(text)))
 
 
+class ManualEntryModal(discord.ui.Modal):
+    """Collect attribution details without recording participation."""
+    def __init__(self, cog, vote, actor, fid=None, user=None):
+        super().__init__(title="Manual alliance ballot", timeout=600)
+        self.cog, self.vote, self.actor = cog, vote, actor
+        self.fid, self.user = fid, user
+        seats = json.loads(vote["electorate"])
+        if not seats or len(seats) > 100:
+            raise ValueError("Manual ballot forms support 1-100 eligible alliances.")
+        self.alliances = []
+        for offset in range(0, len(seats), 25):
+            selector = discord.ui.Select(
+                placeholder="Choose an eligible alliance", required=len(seats) <= 25,
+                min_values=1 if len(seats) <= 25 else 0, max_values=1,
+                options=[discord.SelectOption(label=f"{seat.get('abbr') or 'Alliance'} (ID: {seat['aid']})"[:100],
+                                              value=str(seat["aid"])) for seat in seats[offset:offset + 25]])
+            self.alliances.append(selector)
+            self.add_item(discord.ui.Label(
+                text="Alliance" if len(seats) <= 25 else f"Alliance group {offset // 25 + 1} (choose one total)",
+                component=selector))
+        self.reason = discord.ui.TextInput(style=discord.TextStyle.paragraph,
+                                          required=True, min_length=1, max_length=1000)
+        self.add_item(discord.ui.Label(text="Reason for manual entry", component=self.reason))
+
+    async def on_submit(self, interaction):
+        selected = [value for selector in self.alliances for value in selector.values]
+        if interaction.user.id != self.actor or len(selected) != 1:
+            await interaction.response.send_message("Select exactly one alliance; only the requesting admin may submit.", ephemeral=True)
+            return
+        await self.cog.open_manual_ballot(interaction, int(selected[0]), str(self.reason),
+                                          fid=self.fid, user=self.user, vote_id=self.vote["id"])
+
+
+class RankingView(discord.ui.View):
+    """Private draft editor; only Submit writes a ballot."""
+    def __init__(self, cog, vote, actor, alliance_id, ranking=(), manual=None):
+        super().__init__(timeout=600)
+        self.cog, self.vote, self.actor, self.alliance_id = cog, vote, actor, alliance_id
+        self.options = json.loads(vote["options"])
+        self.ranking = list(ranking)
+        self.selected = None
+        self.manual = manual
+        if manual is None:
+            self.remove_item(self.abstain)
+        self.finished = False
+        self.selector = discord.ui.Select(placeholder="Select an answer to rank or move", row=0,
+            options=[discord.SelectOption(label=label, value=str(i))
+                     for i, label in enumerate(self.options, 1)])
+        self.selector.callback = self.select_answer
+        self.add_item(self.selector)
+        self.refresh()
+
+    def embed(self):
+        ranked = "\n".join(f"{position}. {safe(self.options[i - 1])}"
+                           for position, i in enumerate(self.ranking, 1)) or "None yet"
+        unranked = "\n".join(f"• {safe(label)}" for i, label in enumerate(self.options, 1)
+                             if i not in self.ranking) or "None"
+        embed = discord.Embed(title=f"Vote #{self.vote['id']} — ranking draft",
+            description="Select an answer, then Rank, Unrank or move it. Only Submit records participation. "
+                        "Unranked answers follow your choices using other voters' preferences; "
+                        "equal averages use published option order.")
+        for name, text in [("Your preferences — best first", ranked),
+                           ("Unranked — no explicit preference", unranked)]:
+            chunk = ""
+            for line in text.splitlines():
+                if len(chunk) + len(line) + 1 > 1024:
+                    embed.add_field(name=name, value=chunk, inline=False)
+                    chunk = ""
+                    name = "Continued"
+                chunk += line + "\n"
+            embed.add_field(name=name, value=chunk, inline=False)
+        if self.selected:
+            embed.set_footer(text=f"Selected: {self.options[self.selected - 1]}")
+        return embed
+
+    def refresh(self):
+        ranked = self.selected in self.ranking
+        position = self.ranking.index(self.selected) if ranked else -1
+        self.rank.disabled = self.selected is None or ranked
+        self.unrank.disabled = not ranked
+        self.up.disabled = not ranked or position == 0
+        self.down.disabled = not ranked or position == len(self.ranking) - 1
+        self.submit.disabled = not self.ranking
+        for option in self.selector.options:
+            option.default = int(option.value) == self.selected
+        if self.finished:
+            for item in self.children:
+                item.disabled = True
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.actor:
+            await interaction.response.send_message("This ranking draft belongs to another representative.", ephemeral=True)
+            return False
+        if self.finished:
+            await interaction.response.send_message("This draft is closed. Press Rank to open a new one.", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        self.finished = True
+        self.refresh()
+
+    async def update(self, interaction):
+        self.refresh()
+        await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    async def select_answer(self, interaction):
+        self.selected = int(self.selector.values[0])
+        await self.update(interaction)
+
+    @discord.ui.button(label="Rank", row=1, style=discord.ButtonStyle.success)
+    async def rank(self, interaction, button):
+        if self.selected is not None and self.selected not in self.ranking:
+            self.ranking.append(self.selected)
+        await self.update(interaction)
+
+    @discord.ui.button(label="Unrank", row=1)
+    async def unrank(self, interaction, button):
+        if self.selected in self.ranking:
+            self.ranking.remove(self.selected)
+        await self.update(interaction)
+
+    @discord.ui.button(label="Move up", row=1)
+    async def up(self, interaction, button):
+        if self.selected in self.ranking:
+            position = self.ranking.index(self.selected)
+            if position > 0:
+                self.ranking[position - 1], self.ranking[position] = self.ranking[position], self.ranking[position - 1]
+        await self.update(interaction)
+
+    @discord.ui.button(label="Move down", row=1)
+    async def down(self, interaction, button):
+        if self.selected in self.ranking:
+            position = self.ranking.index(self.selected)
+            if position < len(self.ranking) - 1:
+                self.ranking[position + 1], self.ranking[position] = self.ranking[position], self.ranking[position + 1]
+        await self.update(interaction)
+
+    @discord.ui.button(label="Submit ranking", row=2, style=discord.ButtonStyle.primary)
+    async def submit(self, interaction, button):
+        if self.manual is not None:
+            success = await self.cog.cast_manual(interaction, self.vote["id"], self.alliance_id,
+                                                 list(self.ranking), self.actor, **self.manual)
+        else:
+            success = await self.cog.cast_ballot(interaction, self.vote["id"], list(self.ranking),
+                                                 expected_alliance=self.alliance_id)
+        if success:
+            self.finished = True
+            self.refresh()
+            await interaction.edit_original_response(embed=self.embed(), view=self)
+            self.stop()
+
+    @discord.ui.button(label="Abstain", row=2)
+    async def abstain(self, interaction, button):
+        success = await self.cog.cast_manual(interaction, self.vote["id"], self.alliance_id,
+                                             "ABSTAINED", self.actor, **self.manual)
+        if success:
+            self.finished = True
+            self.refresh()
+            await interaction.edit_original_response(embed=self.embed(), view=self)
+            self.stop()
+
+    @discord.ui.button(label="Cancel", row=2)
+    async def cancel(self, interaction, button):
+        self.finished = True
+        self.refresh()
+        await interaction.response.edit_message(content="Draft cancelled. Your existing ballot is unchanged.",
+                                                embed=None, view=self)
+        self.stop()
+
+
+class ManualVoteView(discord.ui.View):
+    """Private, actor-bound standard ballot for an administrator."""
+    def __init__(self, cog, vote, actor, alliance_id, manual):
+        super().__init__(timeout=600)
+        self.finished = False
+        for label, answer in (("Yes", "YES"), ("No", "NO"), ("Abstain", "ABSTAINED")):
+            button = discord.ui.Button(label=label)
+
+            async def callback(interaction, selected=answer):
+                if self.finished:
+                    await interaction.response.send_message("This ballot panel is closed.", ephemeral=True)
+                    return
+                if await cog.cast_manual(interaction, vote["id"], alliance_id, selected, actor, **manual):
+                    self.finished = True
+                    for item in self.children:
+                        item.disabled = True
+                    await interaction.edit_original_response(view=self)
+                    self.stop()
+
+            button.callback = callback
+            self.add_item(button)
+
+    async def on_timeout(self):
+        self.finished = True
+
+
 class VoteView(discord.ui.View):
     def __init__(self, cog, vote, closed=False):
         super().__init__(timeout=None)
         closed = closed or vote["status"] != "OPEN" or time.time() >= vote["closes_at"]
-        for label, answer, style in [
+        controls = [
             ("Yes", "YES", discord.ButtonStyle.success),
             ("No", "NO", discord.ButtonStyle.danger),
             ("Abstain", "ABSTAINED", discord.ButtonStyle.secondary),
             ("Participation", None, discord.ButtonStyle.primary),
-        ]:
+        ]
+        if vote.get("vote_type") == "RANKED":
+            controls = [("Rank", "RANK", discord.ButtonStyle.success)] + controls[2:]
+        for label, answer, style in controls:
             button = discord.ui.Button(label=label, style=style,
                 custom_id=f"council:{vote['id']}:{answer or 'participation'}",
                 disabled=closed and answer is not None)
@@ -48,6 +248,8 @@ class VoteView(discord.ui.View):
             async def callback(interaction, selected=answer):
                 if selected is None:
                     await cog.show_participation(interaction, vote["id"])
+                elif selected == "RANK":
+                    await cog.open_ranking(interaction, vote["id"])
                 else:
                     await cog.cast_ballot(interaction, vote["id"], selected)
 
@@ -176,10 +378,17 @@ class Council(commands.Cog):
         status = vote["status"]
         if status == "OPEN" and time.time() >= deadline:
             status = "AWAITS_APPROVAL"
+        ranked = ""
+        if vote["vote_type"] == "RANKED":
+            ranked = "\n\n" + "\n".join(f"{i}. {safe(label)}" for i, label in enumerate(json.loads(vote["options"]), 1))
+            ranked += ("\nUse Rank to select answers and move them into preference order. Unranked options follow your choices, "
+                       "ordered by other voters' preferences (equal averages use option order). "
+                       "Use Abstain explicitly; no ballot means no participation. "
+                       "Lowest options transfer until a majority; average rank breaks ties.")
         return discord.Embed(title=f"Council vote #{vote['id']}",
             description=f"### {safe(vote['title'])}\nSubmitted by: {await self.attribution(vote, guild)}\n"
                         f"Status: **{status}**\nVoting closes: <t:{deadline}:F> (<t:{deadline}:R>)\n"
-                        "Each alliance has one ballot. Use Participation to view current ballots.")
+                        "Each alliance has one ballot. Use Participation to view current ballots." + ranked)
 
     def participation_embed(self, vote_id):
         groups = self.store.participation(vote_id)
@@ -187,8 +396,8 @@ class Council(commands.Cog):
         cast = total - len(groups["DID_NOT_VOTE"])
         embed = discord.Embed(title=f"Vote #{vote_id} participation",
                               description=f"{cast}/{total} alliances ({100 * cast / total:.1f}%)")
-        for answer, label in [("YES", "Yes"), ("NO", "No"),
-                              ("ABSTAINED", "Abstained"), ("DID_NOT_VOTE", "Did not vote")]:
+        for answer in groups:
+            label = answer.replace("_", " ").title()
             embed.add_field(name=f"{label}: {len(groups[answer])}",
                             value=safe(" ".join(groups[answer]))[:1024] or "—", inline=False)
         return embed
@@ -197,7 +406,26 @@ class Council(commands.Cog):
         self.vote_for(interaction, vote_id)
         await interaction.response.send_message(embed=self.participation_embed(vote_id), ephemeral=True)
 
-    async def cast_ballot(self, interaction, vote_id, answer):
+    async def open_ranking(self, interaction, vote_id):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with self.lock:
+                vote = self.vote_for(interaction, vote_id)
+                if vote["status"] != "OPEN" or time.time() >= vote["closes_at"]:
+                    raise ValueError("Voting is closed.")
+                await self.reconcile(interaction.guild)
+                aid = next((aid for aid, member in self.mandates.active(interaction.guild_id).items()
+                            if member == interaction.user.id), None)
+                if aid not in {row["aid"] for row in json.loads(vote["electorate"])}:
+                    raise ValueError("Only an eligible alliance's active diplomat may rank options.")
+                rows = [r for r in self.store.audit(vote_id) if r["alliance_id"] == aid]
+                ranking = json.loads(rows[-1]["answer"]) if rows and rows[-1]["answer"] != "ABSTAINED" else []
+                view = RankingView(self, vote, interaction.user.id, aid, ranking)
+            await interaction.followup.send(embed=view.embed(), view=view, ephemeral=True)
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+
+    async def cast_ballot(self, interaction, vote_id, answer, *, expected_alliance=None):
         await interaction.response.defer(ephemeral=True)
         try:
             async with self.lock:
@@ -207,6 +435,8 @@ class Council(commands.Cog):
                             if member == interaction.user.id), None)
                 if aid is None:
                     raise ValueError("Only the alliance's active diplomat may cast its ballot.")
+                if expected_alliance is not None and aid != expected_alliance:
+                    raise ValueError("Your represented alliance changed. Open a new ranking draft.")
                 fid = storage.main_fid_for_discord(interaction.user.id)
                 # Explicit R5/admin appointment permits an unverified server member.
                 # actor is always the actual Discord representative; 0 denotes no linked FID.
@@ -223,8 +453,10 @@ class Council(commands.Cog):
                 if previous:
                     text += f"\nPrevious answer: {previous[-1]['answer']}"
                 await interaction.followup.send(text, ephemeral=True)
+                return True
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
+            return False
 
     async def channel(self, channel_id):
         if not channel_id:
@@ -255,9 +487,22 @@ class Council(commands.Cog):
         groups = self.store.participation(vote["id"])
         lines = ["## Vote result", f"### {safe(vote['title'])}",
                  f"Submitted by: {await self.attribution(vote, guild)}", ""]
-        for answer, label in [("YES", "voted yes"), ("NO", "voted no"),
-                              ("ABSTAINED", "abstained"), ("DID_NOT_VOTE", "did not vote")]:
+        for answer in groups:
+            label = {"YES": "voted yes", "NO": "voted no", "RANKED": "ranked",
+                     "ABSTAINED": "abstained", "DID_NOT_VOTE": "did not vote"}[answer]
             lines.append(f"{len(groups[answer])} {label} - {safe(' '.join(groups[answer])) or '—'}")
+        if vote["vote_type"] == "RANKED":
+            result = json.loads(vote["result"]) if vote["result"] else None
+            options = json.loads(vote["options"])
+            lines += ["", "### Options"] + [f"{i}. {safe(label)}" for i, label in enumerate(options, 1)]
+            if result:
+                if result["winner"]:
+                    lines.append(f"Winner: **{safe(options[result['winner'] - 1])}**")
+                if result["tied"]:
+                    lines.append("Unresolved tie: " + ", ".join(str(i) for i in result["tied"]))
+                for i, round_ in enumerate(result["rounds"], 1):
+                    lines.append(f"Round {i}: {round_['counts']}; eliminated: {round_['eliminated']}"
+                                 + (" (average-rank tiebreak)" if round_["tiebreak"] else ""))
         outcome = vote["status"].lower()
         if outcome == "voided":
             outcome += " due to low participation"
@@ -338,7 +583,7 @@ class Council(commands.Cog):
                                         roles=[discord.Object(id=role_id)] if role_id else False))
                             self.store.update_delivery(pending["id"], notified=1)
                     for vote in reversed(self.store.list_votes(guild.id)):
-                        if vote["status"] in ("PASSED", "FAILED", "VOIDED") and not vote["advanced"]:
+                        if vote["status"] in ("PASSED", "FAILED", "VOIDED", "TIED") and not vote["advanced"]:
                             await self.publish_and_advance(vote, guild)
                 except (ValueError, discord.HTTPException):
                     logger.exception("Council maintenance failed for guild %s", guild.id)
@@ -388,6 +633,17 @@ class Council(commands.Cog):
 
             lines = [f"## Vote #{vote_id}: {safe(vote['title'])}",
                      f"Status: {vote['status']}", "", "### Latest ballots"]
+            if vote["vote_type"] == "RANKED":
+                lines += ["Option numbers (fixed fallback order):"] + [
+                    f"{i}. {safe(label)}" for i, label in enumerate(json.loads(vote["options"]), 1)]
+                if seats:
+                    result = self.store.preview(vote_id)
+                    ranked_rows = sorted((row for row in latest.values() if row["answer"] != "ABSTAINED"),
+                                         key=lambda row: row["alliance_id"])
+                    lines += ["", "### Completed rankings (including delegated preferences)"]
+                    for row, ranking in zip(ranked_rows, result.completed):
+                        lines.append(f"- {safe(tags[row['alliance_id']])}: " + " > ".join(map(str, ranking)))
+                    lines.append(f"Rank sums (divide by {len(result.completed)} ranked ballots for averages): {result.rank_sums}")
             for seat in seats:
                 row = latest.get(seat["aid"])
                 lines.append(f"- {safe(seat['abbr'])} ({seat['aid']}) — " +
@@ -508,10 +764,14 @@ class Council(commands.Cog):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
 
-    @app_commands.command(name="vote_submit", description="Council R4/R5: submit a Yes/No/Abstain proposal.")
+    @app_commands.command(name="vote_submit", description="Council R4/R5: submit a standard or ranked proposal.")
     @app_commands.guild_only()
+    @app_commands.choices(vote_type=[app_commands.Choice(name="Standard", value="STANDARD"),
+                                    app_commands.Choice(name="Ranked", value="RANKED")])
+    @app_commands.describe(options="Ranked answers separated by |, in fixed fallback order (2–20 answers)")
     async def vote_submit(self, interaction: discord.Interaction, question: str,
-                          submitter: discord.Member | None = None, fid: str | None = None):
+                          submitter: discord.Member | None = None, fid: str | None = None,
+                          vote_type: str = "STANDARD", options: str | None = None):
         await interaction.response.defer(ephemeral=True)
         try:
             if len(question) > 1000:
@@ -531,7 +791,8 @@ class Council(commands.Cog):
                 raise ValueError("Only a verified R4/R5 of a council alliance can submit.")
             alliance = storage.alliance_row(aid)
             async with self.lock:
-                vote_id = self.store.submit(interaction.guild_id, question, aid, player["fid"], interaction.user.id)
+                vote_id = self.store.submit(interaction.guild_id, question, aid, player["fid"], interaction.user.id,
+                                            vote_type=vote_type, options=options.split("|") if options else None)
                 self.store.set_identity(vote_id, alliance["abbr"] if alliance else "?",
                                         player["nickname"], player["discord_id"])
             await interaction.followup.send(f"Vote #{vote_id} added to the queue (DEFINED).", ephemeral=True)
@@ -592,59 +853,91 @@ class Council(commands.Cog):
         except (ValueError, discord.HTTPException) as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
 
-    @app_commands.command(name="vote_manual", description="Admin: record an in-game ballot or correction with voting FID and reason.")
+    def current_manual_vote(self, guild_id):
+        votes = [v for v in self.store.list_votes(guild_id)
+                 if v["status"] in ("OPEN", "AWAITS_APPROVAL")]
+        if len(votes) != 1:
+            raise ValueError("There must be exactly one current vote awaiting ballots or approval.")
+        return votes[0]
+
+    async def cast_manual(self, interaction, vote_id, alliance_id, answer, actor, *, fid, reason):
+        await interaction.response.defer(ephemeral=True)
+        try:
+            if interaction.user.id != actor:
+                raise ValueError("This manual ballot belongs to another administrator.")
+            self.require_admin(interaction)
+            async with self.lock:
+                self.vote_for(interaction, vote_id)
+                self.store.cast(vote_id, alliance_id, answer, fid, actor, manual=True, reason=reason)
+            await interaction.followup.send(
+                f"Manual ballot recorded for alliance {alliance_id}. Answer: {safe(answer)}\n"
+                f"Reason: {safe(reason)}", ephemeral=True)
+            return True
+        except ValueError as exc:
+            await interaction.followup.send(str(exc), ephemeral=True)
+            return False
+
+    @app_commands.command(name="vote_manual", description="Admin: privately select an alliance's ballot for the current vote.")
     @app_commands.guild_only()
-    @app_commands.choices(answer=ANSWERS)
-    @app_commands.describe(vote_id="Select an open vote or one awaiting approval by title or ID",
-                           alliance_id="Select an alliance from the selected vote's electorate by tag or ID")
-    async def vote_manual(self, interaction: discord.Interaction, vote_id: int, alliance_id: int,
-                          answer: str, fid: str, reason: str):
+    @app_commands.describe(fid="Optional voting player FID", user="Optional voter; defaults to the assigned diplomat")
+    async def vote_manual(self, interaction: discord.Interaction,
+                          fid: str = None, user: discord.Member = None):
+        try:
+            self.require_admin(interaction)
+            if fid is not None and user is not None:
+                raise ValueError("Supply either a user or FID, not both.")
+            vote = self.current_manual_vote(interaction.guild_id)
+            await interaction.response.send_modal(ManualEntryModal(self, vote, interaction.user.id, fid, user))
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+
+    async def open_manual_ballot(self, interaction, alliance_id, reason, fid=None, user=None, *, vote_id=None):
         await interaction.response.defer(ephemeral=True)
         try:
             self.require_admin(interaction)
-            self.vote_for(interaction, vote_id)
-            if int(fid) <= 0 or len(reason) > 1000:
-                raise ValueError("Supply a positive player FID and a reason of at most 1000 characters.")
-            async with self.lock:
-                self.store.cast(vote_id, alliance_id, answer, int(fid), interaction.user.id,
-                                manual=True, reason=reason)
-            await interaction.followup.send(
-                f"Manual ballot recorded: alliance {alliance_id}, {answer}, player {fid}.\n"
-                f"Reason: {safe(reason)}\n{utc(time.time())}", ephemeral=True)
+            vote = self.vote_for(interaction, vote_id) if vote_id is not None else self.current_manual_vote(interaction.guild_id)
+            if vote["status"] not in ("OPEN", "AWAITS_APPROVAL"):
+                raise ValueError("Voting is closed.")
+            if alliance_id not in {r["aid"] for r in json.loads(vote["electorate"])}:
+                raise ValueError("Alliance is not eligible for this vote.")
+            if not reason.strip() or len(reason) > 1000:
+                raise ValueError("Supply a reason of 1-1000 characters.")
+            if fid is not None and user is not None:
+                raise ValueError("Supply either a user or FID, not both.")
+            member_id = user.id if user else None
+            if fid is None:
+                member_id = member_id or self.mandates.assignments(interaction.guild_id).get(alliance_id)
+                if member_id is None:
+                    raise ValueError("No assigned diplomat. Supply a user or FID.")
+                voter_fid = storage.main_fid_for_discord(member_id) or 0
+            else:
+                voter_fid = int(fid)
+                if voter_fid <= 0:
+                    raise ValueError("Supply a positive player FID.")
+            # Preserve Discord attribution separately from the recording admin in the audit reason.
+            audit_reason = reason.strip() + (f" [voter Discord ID: {member_id}]" if member_id else "")
+            manual = {"fid": voter_fid, "reason": audit_reason}
+            if vote["vote_type"] == "RANKED":
+                rows = [r for r in self.store.audit(vote["id"]) if r["alliance_id"] == alliance_id]
+                ranking = json.loads(rows[-1]["answer"]) if rows and rows[-1]["answer"] != "ABSTAINED" else []
+                view = RankingView(self, vote, interaction.user.id, alliance_id, ranking, manual=manual)
+                embed = view.embed()
+            else:
+                view = ManualVoteView(self, vote, interaction.user.id, alliance_id, manual)
+                embed = discord.Embed(title=f"Manual ballot - {vote['title']}",
+                                      description="Select Yes, No or Abstain. Opening this panel does not record a ballot.")
+            embed.add_field(name="Manual entry", value=f"Alliance ID: {alliance_id}\nReason: {safe(reason)}"[:1024], inline=False)
+            await interaction.followup.send(embed=embed, view=view, ephemeral=True)
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
 
-    @vote_manual.autocomplete("vote_id")
-    async def manual_vote_autocomplete(self, interaction: discord.Interaction, current: str):
-        if not interaction.guild_id or not PermissionManager.is_admin(interaction.user.id)[0]:
-            return []
-
-        def choices():
-            query = current.strip().casefold()
-            results = []
-            for vote in self.store.list_votes(interaction.guild_id):
-                if vote["status"] not in ("OPEN", "AWAITS_APPROVAL"):
-                    continue
-                label = f"#{vote['id']} · {vote['title']}"
-                if query in label.casefold():
-                    results.append(app_commands.Choice(name=label[:100], value=vote["id"]))
-                if len(results) == 25:
-                    break
-            return results
-
-        return await asyncio.to_thread(choices)
-
-    @vote_manual.autocomplete("alliance_id")
     async def manual_alliance_autocomplete(self, interaction: discord.Interaction, current: str):
         if not interaction.guild_id or not PermissionManager.is_admin(interaction.user.id)[0]:
-            return []
-        vote_id = getattr(interaction.namespace, "vote_id", None)
-        if vote_id is None:
             return []
 
         def choices():
             try:
-                vote = self.store.get(vote_id)
+                vote = self.current_manual_vote(interaction.guild_id)
             except ValueError:
                 return []
             if vote["guild_id"] != interaction.guild_id or vote["status"] not in ("OPEN", "AWAITS_APPROVAL"):
@@ -674,12 +967,16 @@ class Council(commands.Cog):
             vote = self.store.pending(interaction.guild_id)
             if not vote:
                 raise ValueError("No pending vote.")
-            groups = self.store.participation(vote["id"])
-            result = tally(sum(map(len, groups.values())), len(groups["YES"]),
-                           len(groups["NO"]), len(groups["ABSTAINED"]))
+            result = self.store.preview(vote["id"])
             if vote["status"] == "OPEN" and not result.early_conclusion:
-                raise ValueError("Early conclusion requires Yes > half of all eligible alliances.")
-            await interaction.followup.send(f"Proposed outcome: **{result.status}**. "
+                raise ValueError("Early conclusion requires Yes/first-choice support > half of all eligible alliances.")
+            details = ""
+            if vote["vote_type"] == "RANKED":
+                if result.winner:
+                    details = f" Winner: **{safe(json.loads(vote['options'])[result.winner - 1])}**."
+                elif result.tied:
+                    details = " Unresolved tie between option numbers: " + ", ".join(map(str, result.tied)) + "."
+            await interaction.followup.send(f"Proposed outcome: **{result.status}**.{details} "
                 "Confirmation revalidates current ballots before concluding.",
                 embed=self.participation_embed(vote["id"]),
                 view=ConclusionView(self, vote["id"], interaction.user.id), ephemeral=True)
