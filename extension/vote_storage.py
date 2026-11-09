@@ -9,7 +9,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 
-from .voting import QueueEntry, normalize_queue, tally
+from .voting import QueueEntry, normalize_queue, tally, ranked_tally, validate_options, validate_ranking
 
 
 class VoteStore:
@@ -55,6 +55,9 @@ class VoteStore:
                 "channel_id": "INTEGER", "message_id": "INTEGER",
                 "result_message_id": "INTEGER", "notified": "INTEGER DEFAULT 0",
                 "advanced": "INTEGER DEFAULT 0",
+                "vote_type": "TEXT NOT NULL DEFAULT 'STANDARD'",
+                "options": "TEXT NOT NULL DEFAULT '[]'",
+                "result": "TEXT",
             }.items():
                 if name not in columns:
                     conn.execute(f"ALTER TABLE votes ADD COLUMN {name} {definition}")
@@ -98,10 +101,16 @@ class VoteStore:
             conn.execute("UPDATE votes SET position=?,priority=? WHERE id=?",
                          (position, entry.priority, entry.vote_id))
 
-    def submit(self, guild_id, title, alliance_id, fid, actor, *, now=None):
+    def submit(self, guild_id, title, alliance_id, fid, actor, *, now=None,
+               vote_type="STANDARD", options=None):
         title = title.strip()
         if not title:
             raise ValueError("A question is required.")
+        if vote_type not in ("STANDARD", "RANKED"):
+            raise ValueError("Unknown vote type.")
+        if vote_type == "STANDARD" and options:
+            raise ValueError("Standard votes do not accept options.")
+        options = validate_options(options or []) if vote_type == "RANKED" else []
         with self._connect() as conn:
             lowest = conn.execute(
                 "SELECT MIN(priority) FROM votes WHERE guild_id=? AND alliance_id=? "
@@ -112,9 +121,9 @@ class VoteStore:
                 "WHERE guild_id=? AND status='DEFINED'", (guild_id,)).fetchone()[0]
             cursor = conn.execute(
                 "INSERT INTO votes(guild_id,title,alliance_id,submitter_fid,"
-                "submitted_by,submitted_at,priority,position) VALUES(?,?,?,?,?,?,?,?)",
+                "submitted_by,submitted_at,priority,position,vote_type,options) VALUES(?,?,?,?,?,?,?,?,?,?)",
                 (guild_id, title, alliance_id, fid, actor, self._now(now),
-                 0 if lowest is None else lowest - 1, position))
+                 0 if lowest is None else lowest - 1, position, vote_type, json.dumps(options)))
             self._normalize(conn, guild_id)
             return cursor.lastrowid
 
@@ -207,12 +216,15 @@ class VoteStore:
              manual=False, reason=""):
         now = self._now(now)
         self.expire(now=now)
-        if answer not in ("YES", "NO", "ABSTAINED"):
-            raise ValueError("Unknown answer.")
         if manual and not reason.strip():
             raise ValueError("A manual ballot requires a reason.")
         with self._connect() as conn:
             vote = self._get(conn, vote_id)
+            if vote["vote_type"] == "RANKED":
+                if answer != "ABSTAINED":
+                    answer = json.dumps(validate_ranking(answer, len(json.loads(vote["options"]))))
+            elif answer not in ("YES", "NO", "ABSTAINED"):
+                raise ValueError("Unknown answer.")
             allowed = ("OPEN", "AWAITS_APPROVAL") if manual else ("OPEN",)
             if vote["status"] not in allowed:
                 raise ValueError("Voting is closed.")
@@ -234,9 +246,14 @@ class VoteStore:
     def _participation(conn, vote):
         ballots = {row["alliance_id"]: row["answer"] for row in conn.execute(
             "SELECT alliance_id,answer FROM ballots WHERE vote_id=?", (vote["id"],))}
-        groups = {answer: [] for answer in ("YES", "NO", "ABSTAINED", "DID_NOT_VOTE")}
+        ranked = vote["vote_type"] == "RANKED"
+        groups = {answer: [] for answer in (("RANKED", "ABSTAINED", "DID_NOT_VOTE") if ranked else
+                                           ("YES", "NO", "ABSTAINED", "DID_NOT_VOTE"))}
         for alliance in json.loads(vote["electorate"]):
-            groups[ballots.get(alliance["aid"], "DID_NOT_VOTE")].append(alliance["abbr"])
+            answer = ballots.get(alliance["aid"], "DID_NOT_VOTE")
+            if ranked and answer not in ("ABSTAINED", "DID_NOT_VOTE"):
+                answer = "RANKED"
+            groups[answer].append(alliance["abbr"])
         return groups
 
     def participation(self, vote_id):
@@ -248,6 +265,21 @@ class VoteStore:
             return [dict(row) for row in conn.execute(
                 "SELECT * FROM ballot_audit WHERE vote_id=? ORDER BY id", (vote_id,))]
 
+    @staticmethod
+    def _tally(conn, vote):
+        groups = VoteStore._participation(conn, vote)
+        eligible = sum(map(len, groups.values()))
+        if vote["vote_type"] == "STANDARD":
+            return tally(eligible, len(groups["YES"]), len(groups["NO"]), len(groups["ABSTAINED"]))
+        rankings = [json.loads(row[0]) for row in conn.execute(
+            "SELECT answer FROM ballots WHERE vote_id=? AND answer!='ABSTAINED' ORDER BY alliance_id",
+            (vote["id"],))]
+        return ranked_tally(eligible, len(json.loads(vote["options"])), rankings, len(groups["ABSTAINED"]))
+
+    def preview(self, vote_id):
+        with self._connect() as conn:
+            return self._tally(conn, self._get(conn, vote_id))
+
     def conclude(self, vote_id, actor, *, now=None):
         now = self._now(now)
         self.expire(now=now)
@@ -255,13 +287,14 @@ class VoteStore:
             vote = self._get(conn, vote_id)
             if vote["status"] not in ("OPEN", "AWAITS_APPROVAL"):
                 raise ValueError("Vote is not pending.")
-            groups = self._participation(conn, vote)
-            result = tally(sum(map(len, groups.values())), len(groups["YES"]),
-                           len(groups["NO"]), len(groups["ABSTAINED"]))
+            result = self._tally(conn, vote)
             if vote["status"] == "OPEN" and not result.early_conclusion:
-                raise ValueError("An absolute Yes majority is required to conclude early.")
+                raise ValueError("An absolute Yes/first-choice majority is required to conclude early.")
             conn.execute("UPDATE votes SET status=?,concluded_by=?,concluded_at=? "
                          "WHERE id=?", (result.status, actor, now, vote_id))
+            if vote["vote_type"] == "RANKED":
+                from dataclasses import asdict
+                conn.execute("UPDATE votes SET result=? WHERE id=?", (json.dumps(asdict(result)), vote_id))
             return result.status
 
     def remove(self, vote_id, actor, reason, *, now=None):
