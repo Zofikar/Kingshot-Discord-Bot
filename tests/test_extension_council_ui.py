@@ -14,6 +14,7 @@ from extension.vote_storage import VoteStore
 def council(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     from extension.cogs.council import Council
+    monkeypatch.setattr("extension.cogs.council.mightpulse.fetch_player_data", AsyncMock(return_value=None))
     storage.ensure_schema()
     settings = SettingsStore()
     store = VoteStore()
@@ -29,6 +30,75 @@ def report_interaction(guild):
     return SimpleNamespace(guild_id=guild.id, guild=guild, user=SimpleNamespace(id=99),
                            response=SimpleNamespace(defer=AsyncMock(), send_message=AsyncMock()),
                            followup=SimpleNamespace(send=AsyncMock()))
+
+
+def test_missing_submitter_identity_is_fetched(council, monkeypatch):
+    cog, store, guild = council
+    fetch = AsyncMock(return_value={"nick_name": "Alice", "alliance": {"abbr": "BBQ"}})
+    monkeypatch.setattr("extension.cogs.council.mightpulse.fetch_player_data", fetch)
+    vote = store.submit(1, "Question", 7, 100, 42)
+    assert asyncio.run(cog.attribution(store.get(vote), guild)) == "[BBQ] Alice (100)"
+    fetch.assert_awaited_once_with("100")
+
+
+def test_submit_unregistered_fid_resolves_without_registering(council, monkeypatch):
+    from extension.cogs.council import PermissionManager
+    cog, store, guild = council
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (True,))
+    fetch = AsyncMock(return_value={"nick_name": "Alice", "alliance": {"aid": 7, "abbr": "BBQ"}})
+    monkeypatch.setattr("extension.cogs.council.mightpulse.fetch_player_data", fetch)
+    interaction = report_interaction(guild)
+    asyncio.run(cog.vote_submit.callback(cog, interaction, "Question", fid="100"))
+    vote = store.queue(guild.id)[0]
+    assert vote["submitter_fid"] == 100
+    assert vote["alliance_id"] == 7
+    assert vote["submitter_name"] == "Alice"
+    assert vote["submitter_tag"] == "BBQ"
+    assert vote["submitter_discord"] is None
+    assert storage.user_row(100) is None
+    assert storage.alliance_row(7) is None
+    assert asyncio.run(cog.attribution(vote, guild)) == "[BBQ] Alice (100)"
+    fetch.assert_awaited_once_with("100")
+
+
+@pytest.mark.parametrize("result", [None, "NOT_FOUND", "RATE_LIMITED"])
+def test_submit_unresolved_fid_does_not_queue_or_require_registration(council, monkeypatch, result):
+    from extension.cogs.council import PermissionManager
+    cog, store, guild = council
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (True,))
+    monkeypatch.setattr("extension.cogs.council.mightpulse.fetch_player_data", AsyncMock(return_value=result))
+    interaction = report_interaction(guild)
+    asyncio.run(cog.vote_submit.callback(cog, interaction, "Question", fid="100"))
+    assert store.queue(guild.id) == []
+    assert "Could not resolve" in interaction.followup.send.await_args.args[0]
+
+
+def test_manual_voter_identity_is_fetched(council, monkeypatch):
+    cog, store, guild = council
+    fetch = AsyncMock(return_value={"nick_name": "Bob", "alliance": {"abbr": "ALT"}})
+    monkeypatch.setattr("extension.cogs.council.mightpulse.fetch_player_data", fetch)
+    vote = store.submit(1, "Question", 7, 100, 42, now=1)
+    store.set_identity(vote, "BBQ", "Alice", None)
+    store.open_next(1, [{"aid": 7, "abbr": "BBQ"}], now=2)
+    store.cast(vote, 7, "YES", 200, 99, now=3, manual=True, reason="In game")
+    text = asyncio.run(cog.result_text(store.get(vote), guild))
+    assert "[ALT] Bob (200) — entered by <@99>" in text
+    fetch.assert_awaited_once_with("200")
+
+
+def test_identity_lookup_failure_preserves_saved_data(council, monkeypatch):
+    cog, _, _ = council
+    monkeypatch.setattr("extension.cogs.council.mightpulse.fetch_player_data",
+                        AsyncMock(side_effect=RuntimeError("Unavailable")))
+    assert asyncio.run(cog.player_attribution(100, "BBQ")) == "[BBQ] Unknown (100)"
+
+
+def test_present_submitter_keeps_discord_mention(council):
+    cog, store, guild = council
+    vote = store.submit(1, "Question", 7, 100, 42)
+    store.set_identity(vote, "BBQ", "Alice", 42)
+    guild.get_member = lambda member_id: SimpleNamespace(id=member_id)
+    assert asyncio.run(cog.attribution(store.get(vote), guild)) == "<@42>"
 
 
 def test_manual_vote_id_hints(council, monkeypatch):

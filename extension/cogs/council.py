@@ -13,6 +13,7 @@ from discord.ext import commands, tasks
 from cogs.permission_handler import PermissionManager
 from .. import storage
 from ..council import MandateStore
+from ..providers import mightpulse
 from ..settings import SettingsStore
 from ..vote_storage import VoteStore
 from ..voting import parse_ranking
@@ -367,11 +368,29 @@ class Council(commands.Cog):
                 except discord.HTTPException:
                     logger.exception("Could not reconcile diplomat role for %s", member.id)
 
+    async def player_attribution(self, fid, tag=None, name=None):
+        player = storage.user_row(fid) if fid else None
+        if player:
+            name = name or player["nickname"]
+            alliance = storage.alliance_row(player["alliance"])
+            tag = tag or (alliance["abbr"] if alliance else None)
+        if fid and (not name or not tag or tag == "?"):
+            try:
+                fetched = await mightpulse.fetch_player_data(str(fid))
+                if isinstance(fetched, dict):
+                    name = name or fetched.get("nick_name")
+                    if not tag or tag == "?":
+                        tag = (fetched.get("alliance") or {}).get("abbr") or tag
+            except Exception:
+                logger.exception("Could not resolve voting player %s", fid)
+        return f"[{safe(tag or '?')}] {safe(name or 'Unknown')} ({fid})"
+
     async def attribution(self, vote, guild):
         member_id = vote["submitter_discord"]
         if member_id and guild.get_member(member_id):
             return f"<@{member_id}>"
-        return f"[{safe(vote['submitter_tag'] or '?')}] {safe(vote['submitter_name'] or 'Unknown')} ({vote['submitter_fid']})"
+        return await self.player_attribution(vote["submitter_fid"],
+                                             vote["submitter_tag"], vote["submitter_name"])
 
     async def vote_embed(self, vote, guild):
         deadline = int(vote["closes_at"])
@@ -513,10 +532,9 @@ class Council(commands.Cog):
             lines += ["", "### Manual vote adjustments"]
             tags = {r["aid"]: r["abbr"] for r in json.loads(vote["electorate"])}
             for row in manual:
-                player = storage.user_row(row["fid"])
-                name = player["nickname"] if player else "Unknown"
+                voter = await self.player_attribution(row["fid"])
                 lines.append(f"- {safe(tags[row['alliance_id']])} — {row['answer']} — "
-                             f"{safe(name)} ({row['fid']}) — entered by <@{row['actor']}> at "
+                             f"{voter} — entered by <@{row['actor']}> at "
                              f"{utc(row['recorded_at'])} — {safe(row['reason'])}"
                              + (f" (replaces {row['previous_answer']})" if row["previous_answer"] else ""))
         return "\n".join(lines)
@@ -783,8 +801,21 @@ class Council(commands.Cog):
                 raise ValueError("Only admins can submit on behalf of another player.")
             player = dict(storage.user_row(int(fid)) or {}) if fid else self.main_player(
                 submitter.id if submitter else interaction.user.id)
+            resolved_tag = None
             if not player:
-                raise ValueError("Unknown FID; register the player first.")
+                if int(fid) <= 0:
+                    raise ValueError("Enter a positive player FID.")
+                try:
+                    fetched = await mightpulse.fetch_player_data(str(int(fid)))
+                except Exception:
+                    logger.exception("Could not resolve proposal submitter %s", fid)
+                    fetched = None
+                if not isinstance(fetched, dict) or not fetched.get("nick_name"):
+                    raise ValueError("Could not resolve that FID right now. Check the FID or try again later.")
+                fetched_alliance = fetched.get("alliance") or {}
+                resolved_tag = fetched_alliance.get("abbr")
+                player = {"fid": int(fid), "nickname": fetched["nick_name"],
+                          "alliance": fetched_alliance.get("aid"), "discord_id": None}
             aid = int(player["alliance"] or 0)
             if not admin and (player["rank"] not in (4, 5) or aid not in {
                     r["aid"] for r in storage.latest_nap_snapshot()}):
@@ -793,7 +824,7 @@ class Council(commands.Cog):
             async with self.lock:
                 vote_id = self.store.submit(interaction.guild_id, question, aid, player["fid"], interaction.user.id,
                                             vote_type=vote_type, options=options.split("|") if options else None)
-                self.store.set_identity(vote_id, alliance["abbr"] if alliance else "?",
+                self.store.set_identity(vote_id, resolved_tag or (alliance["abbr"] if alliance else "?"),
                                         player["nickname"], player["discord_id"])
             await interaction.followup.send(f"Vote #{vote_id} added to the queue (DEFINED).", ephemeral=True)
         except (ValueError, TypeError) as exc:
