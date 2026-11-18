@@ -32,6 +32,70 @@ def report_interaction(guild):
                            followup=SimpleNamespace(send=AsyncMock()))
 
 
+@pytest.mark.parametrize("answers,kind,count", [
+    ({}, "STANDARD", 0),
+    ({"answer4": "A", "answer20": "B"}, "STANDARD", 2),
+    ({"answer2": "A", "answer9": "B", "answer18": "C"}, "RANKED", 3),
+    ({f"answer{i}": str(i) for i in range(1, 21)}, "RANKED", 20),
+])
+def test_submit_infers_type_from_sparse_answers(council, monkeypatch, answers, kind, count):
+    import json
+    from extension.cogs.council import PermissionManager
+    cog, store, guild = council
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (True,))
+    monkeypatch.setattr(cog, "main_player", lambda member_id: {
+        "fid": 100, "alliance": 7, "nickname": "Alice", "discord_id": 99})
+    interaction = report_interaction(guild)
+    asyncio.run(cog.vote_submit.callback(cog, interaction, "Question", **answers))
+    vote = store.queue(1)[0]
+    assert vote["vote_type"] == kind
+    assert len(json.loads(vote["options"])) == count
+    assert json.loads(vote["options"]) == list(answers.values())
+
+
+@pytest.mark.parametrize("answers", [{"answer8": "A"}, {"answer1": "A", "answer20": "a"},
+                                         {"answer2": " ", "answer3": "B"}])
+def test_submit_rejects_invalid_answers(council, monkeypatch, answers):
+    from extension.cogs.council import PermissionManager
+    cog, store, guild = council
+    monkeypatch.setattr(PermissionManager, "is_admin", lambda member_id: (True,))
+    monkeypatch.setattr(cog, "main_player", lambda member_id: {
+        "fid": 100, "alliance": 7, "nickname": "Alice", "discord_id": 99})
+    interaction = report_interaction(guild)
+    asyncio.run(cog.vote_submit.callback(cog, interaction, "Question", **answers))
+    assert store.queue(1) == []
+
+
+@pytest.mark.parametrize("ballots,status,winner", [
+    (["YES", "YES"], "SELECTED", "A"),
+    (["NO", "NO"], "SELECTED", "B"),
+    (["YES", "NO"], "TIED", None),
+    (["ABSTAINED", "ABSTAINED"], "FAILED", None),
+    ([], "VOIDED", None),
+])
+def test_choice_outcomes_and_messages(council, ballots, status, winner):
+    from extension.cogs.council import VoteView, ManualVoteView
+    cog, store, guild = council
+    vote_id = store.submit(1, "Choose", 7, 100, 99, options=["A", "B"], now=1)
+    store.set_identity(vote_id, "TAG", "Alice", None)
+    store.open_next(1, [{"aid": 7, "abbr": "TAG"}, {"aid": 8, "abbr": "ALT"}], now=2)
+    for aid, answer in zip((7, 8), ballots):
+        store.cast(vote_id, aid, answer, 100, 99, now=3)
+    result = store.preview(vote_id)
+    assert result.status == status
+    assert result.early_conclusion == (status == "SELECTED")
+    assert store.conclude(vote_id, 99, now=90000) == status
+    vote = store.get(vote_id)
+    text = asyncio.run(cog.result_text(vote, guild))
+    assert "voted yes" not in text and "voted no" not in text
+    if winner:
+        assert f"Selected answer: **{winner}**" in text
+    async def check_views():
+        assert [b.label for b in VoteView(cog, vote).children][:2] == ["A", "B"]
+        assert [b.label for b in ManualVoteView(cog, vote, 99, 7, {}).children][:2] == ["A", "B"]
+    asyncio.run(check_views())
+
+
 def test_missing_submitter_identity_is_fetched(council, monkeypatch):
     cog, store, guild = council
     fetch = AsyncMock(return_value={"nick_name": "Alice", "alliance": {"abbr": "BBQ"}})

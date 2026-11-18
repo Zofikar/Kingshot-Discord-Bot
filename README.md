@@ -53,8 +53,10 @@ to worst, and the lowest option is eliminated each round, transferring ballots
 to their next remaining preference until an option has a strict majority.
 Standard Yes/No/Abstain voting remains unchanged and is the default.
 
-Create one with `/vote_submit`, choosing `vote_type: Ranked` and entering options
-such as `8 | 10 | 12`. **Rank** opens a private draft showing ranked and unranked
+Use `/vote_submit` with optional `answer1` through `answer20` fields (gaps allowed).
+No answers creates Yes/No voting; two creates a standard choice vote; 3–20 creates
+a ranked vote. Exactly one answer is rejected. For example, `answer1:8 answer2:10
+answer3:12` creates a ranked vote. **Rank** opens a private draft showing ranked and unranked
 answers separately. Select an answer, use **Rank / Unrank** and **Move up / Move
 down**, then **Submit ranking**. Existing explicit preferences load when editing;
 opening, editing or cancelling never changes a ballot or records participation.

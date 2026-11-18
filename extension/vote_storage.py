@@ -108,9 +108,9 @@ class VoteStore:
             raise ValueError("A question is required.")
         if vote_type not in ("STANDARD", "RANKED"):
             raise ValueError("Unknown vote type.")
-        if vote_type == "STANDARD" and options:
-            raise ValueError("Standard votes do not accept options.")
-        options = validate_options(options or []) if vote_type == "RANKED" else []
+        options = validate_options(options or []) if options or vote_type == "RANKED" else []
+        if vote_type == "STANDARD" and options and len(options) != 2:
+            raise ValueError("Standard choice votes require exactly two answers.")
         with self._connect() as conn:
             lowest = conn.execute(
                 "SELECT MIN(priority) FROM votes WHERE guild_id=? AND alliance_id=? "
@@ -270,6 +270,14 @@ class VoteStore:
         groups = VoteStore._participation(conn, vote)
         eligible = sum(map(len, groups.values()))
         if vote["vote_type"] == "STANDARD":
+            if json.loads(vote["options"]):
+                from .voting import Tally
+                first, second = len(groups["YES"]), len(groups["NO"])
+                cast = first + second + len(groups["ABSTAINED"])
+                status = ("VOIDED" if 100 * cast < 45 * eligible else
+                          "FAILED" if not first + second else
+                          "TIED" if first == second else "SELECTED")
+                return Tally(status, 2 * max(first, second) > eligible, eligible - cast)
             return tally(eligible, len(groups["YES"]), len(groups["NO"]), len(groups["ABSTAINED"]))
         rankings = [json.loads(row[0]) for row in conn.execute(
             "SELECT answer FROM ballots WHERE vote_id=? AND answer!='ABSTAINED' ORDER BY alliance_id",
@@ -289,7 +297,7 @@ class VoteStore:
                 raise ValueError("Vote is not pending.")
             result = self._tally(conn, vote)
             if vote["status"] == "OPEN" and not result.early_conclusion:
-                raise ValueError("An absolute Yes/first-choice majority is required to conclude early.")
+                raise ValueError("An absolute majority for Yes, either choice, or a ranked first choice is required to conclude early.")
             conn.execute("UPDATE votes SET status=?,concluded_by=?,concluded_at=? "
                          "WHERE id=?", (result.status, actor, now, vote_id))
             if vote["vote_type"] == "RANKED":

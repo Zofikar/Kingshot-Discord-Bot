@@ -208,7 +208,8 @@ class ManualVoteView(discord.ui.View):
     def __init__(self, cog, vote, actor, alliance_id, manual):
         super().__init__(timeout=600)
         self.finished = False
-        for label, answer in (("Yes", "YES"), ("No", "NO"), ("Abstain", "ABSTAINED")):
+        options = json.loads(vote.get("options", "[]")) or ["Yes", "No"]
+        for label, answer in ((options[0], "YES"), (options[1], "NO"), ("Abstain", "ABSTAINED")):
             button = discord.ui.Button(label=label)
 
             async def callback(interaction, selected=answer):
@@ -241,6 +242,10 @@ class VoteView(discord.ui.View):
         ]
         if vote.get("vote_type") == "RANKED":
             controls = [("Rank", "RANK", discord.ButtonStyle.success)] + controls[2:]
+        elif json.loads(vote.get("options", "[]")):
+            options = json.loads(vote["options"])
+            controls = [(options[0], "YES", discord.ButtonStyle.primary),
+                        (options[1], "NO", discord.ButtonStyle.primary)] + controls[2:]
         for label, answer, style in controls:
             button = discord.ui.Button(label=label, style=style,
                 custom_id=f"council:{vote['id']}:{answer or 'participation'}",
@@ -398,6 +403,8 @@ class Council(commands.Cog):
         if status == "OPEN" and time.time() >= deadline:
             status = "AWAITS_APPROVAL"
         ranked = ""
+        if vote["vote_type"] == "STANDARD" and json.loads(vote["options"]):
+            ranked = "\n\nChoose one answer: " + " / ".join(safe(x) for x in json.loads(vote["options"]))
         if vote["vote_type"] == "RANKED":
             ranked = "\n\n" + "\n".join(f"{i}. {safe(label)}" for i, label in enumerate(json.loads(vote["options"]), 1))
             ranked += ("\nUse Rank to select answers and move them into preference order. Unranked options follow your choices, "
@@ -411,12 +418,16 @@ class Council(commands.Cog):
 
     def participation_embed(self, vote_id):
         groups = self.store.participation(vote_id)
+        vote = self.store.get(vote_id)
+        options = json.loads(vote["options"]) if vote["vote_type"] == "STANDARD" else []
         total = sum(map(len, groups.values()))
         cast = total - len(groups["DID_NOT_VOTE"])
         embed = discord.Embed(title=f"Vote #{vote_id} participation",
                               description=f"{cast}/{total} alliances ({100 * cast / total:.1f}%)")
         for answer in groups:
             label = answer.replace("_", " ").title()
+            if options and answer in ("YES", "NO"):
+                label = safe(options[0 if answer == "YES" else 1])
             embed.add_field(name=f"{label}: {len(groups[answer])}",
                             value=safe(" ".join(groups[answer]))[:1024] or "—", inline=False)
         return embed
@@ -465,12 +476,12 @@ class Council(commands.Cog):
                 self.store.cast(vote_id, aid, answer, fid, interaction.user.id, now=recorded)
                 tag = next(r["abbr"] for r in json.loads(vote["electorate"]) if r["aid"] == aid)
                 text = (f"Your alliance's vote has been recorded.\nVote: {safe(vote['title'])}\n"
-                        f"Alliance: {safe(tag)}\nAnswer: {answer}\n"
+                        f"Alliance: {safe(tag)}\nAnswer: {self.answer_label(vote, answer)}\n"
                         f"Representative: {interaction.user.mention}"
                         + (f" ({fid})" if fid else " (no linked FID)")
                         + f"\nRecorded at: {utc(recorded)}")
                 if previous:
-                    text += f"\nPrevious answer: {previous[-1]['answer']}"
+                    text += f"\nPrevious answer: {self.answer_label(vote, previous[-1]['answer'])}"
                 await interaction.followup.send(text, ephemeral=True)
                 return True
         except ValueError as exc:
@@ -502,13 +513,23 @@ class Council(commands.Cog):
                                      allowed_mentions=discord.AllowedMentions.none())
         self.store.update_delivery(vote["id"], channel_id=channel.id, message_id=message.id)
 
+    @staticmethod
+    def answer_label(vote, answer):
+        options = json.loads(vote["options"])
+        if vote["vote_type"] == "STANDARD" and options and answer in ("YES", "NO"):
+            return safe(options[0 if answer == "YES" else 1])
+        return str(answer)
+
     async def result_text(self, vote, guild):
         groups = self.store.participation(vote["id"])
         lines = ["## Vote result", f"### {safe(vote['title'])}",
                  f"Submitted by: {await self.attribution(vote, guild)}", ""]
+        choices = json.loads(vote["options"]) if vote["vote_type"] == "STANDARD" else []
         for answer in groups:
             label = {"YES": "voted yes", "NO": "voted no", "RANKED": "ranked",
                      "ABSTAINED": "abstained", "DID_NOT_VOTE": "did not vote"}[answer]
+            if choices and answer in ("YES", "NO"):
+                label = f"chose {safe(choices[0 if answer == 'YES' else 1])}"
             lines.append(f"{len(groups[answer])} {label} - {safe(' '.join(groups[answer])) or '—'}")
         if vote["vote_type"] == "RANKED":
             result = json.loads(vote["result"]) if vote["result"] else None
@@ -518,10 +539,21 @@ class Council(commands.Cog):
                 if result["winner"]:
                     lines.append(f"Winner: **{safe(options[result['winner'] - 1])}**")
                 if result["tied"]:
-                    lines.append("Unresolved tie: " + ", ".join(str(i) for i in result["tied"]))
+                    lines.append("Unresolved tie: " + ", ".join(safe(options[i - 1]) for i in result["tied"]))
                 for i, round_ in enumerate(result["rounds"], 1):
-                    lines.append(f"Round {i}: {round_['counts']}; eliminated: {round_['eliminated']}"
+                    counts = ", ".join(f"{safe(options[int(option) - 1])}: {count}"
+                                       for option, count in round_["counts"].items())
+                    eliminated = safe(options[round_["eliminated"] - 1]) if round_["eliminated"] else "none"
+                    lines.append(f"Round {i}: {counts}; eliminated: {eliminated}"
                                  + (" (average-rank tiebreak)" if round_["tiebreak"] else ""))
+        if choices:
+            if vote["status"] == "SELECTED":
+                winner = choices[0 if len(groups["YES"]) > len(groups["NO"]) else 1]
+                lines += ["", f"Selected answer: **{safe(winner)}**"]
+            elif vote["status"] == "TIED":
+                lines += ["", "No answer selected: tied between " + " / ".join(safe(x) for x in choices)]
+            elif vote["status"] == "FAILED":
+                lines += ["", "No answer selected: all participating alliances abstained."]
         outcome = vote["status"].lower()
         if outcome == "voided":
             outcome += " due to low participation"
@@ -533,10 +565,10 @@ class Council(commands.Cog):
             tags = {r["aid"]: r["abbr"] for r in json.loads(vote["electorate"])}
             for row in manual:
                 voter = await self.player_attribution(row["fid"])
-                lines.append(f"- {safe(tags[row['alliance_id']])} — {row['answer']} — "
+                lines.append(f"- {safe(tags[row['alliance_id']])} — {self.answer_label(vote, row['answer'])} — "
                              f"{voter} — entered by <@{row['actor']}> at "
                              f"{utc(row['recorded_at'])} — {safe(row['reason'])}"
-                             + (f" (replaces {row['previous_answer']})" if row["previous_answer"] else ""))
+                             + (f" (replaces {self.answer_label(vote, row['previous_answer'])})" if row["previous_answer"] else ""))
         return "\n".join(lines)
 
     async def publish_and_advance(self, vote, guild):
@@ -601,7 +633,7 @@ class Council(commands.Cog):
                                         roles=[discord.Object(id=role_id)] if role_id else False))
                             self.store.update_delivery(pending["id"], notified=1)
                     for vote in reversed(self.store.list_votes(guild.id)):
-                        if vote["status"] in ("PASSED", "FAILED", "VOIDED", "TIED") and not vote["advanced"]:
+                        if vote["status"] in ("PASSED", "FAILED", "VOIDED", "TIED", "SELECTED") and not vote["advanced"]:
                             await self.publish_and_advance(vote, guild)
                 except (ValueError, discord.HTTPException):
                     logger.exception("Council maintenance failed for guild %s", guild.id)
@@ -646,7 +678,7 @@ class Council(commands.Cog):
                 identity = (f"Entered by admin <@{row['actor']}>" if row["manual"] else
                             f"Voter <@{row['actor']}>")
                 fid = str(row["fid"]) if row["fid"] else "none linked"
-                return (f"{row['answer']} — {identity} (Discord ID: {row['actor']})"
+                return (f"{self.answer_label(vote, row['answer'])} — {identity} (Discord ID: {row['actor']})"
                         f" — FID: {fid} — {utc(row['recorded_at'])}")
 
             lines = [f"## Vote #{vote_id}: {safe(vote['title'])}",
@@ -782,16 +814,29 @@ class Council(commands.Cog):
         except ValueError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
 
-    @app_commands.command(name="vote_submit", description="Council R4/R5: submit a standard or ranked proposal.")
+    @app_commands.command(name="vote_submit", description="Council R4/R5: submit a yes/no, choice or ranked proposal.")
     @app_commands.guild_only()
-    @app_commands.choices(vote_type=[app_commands.Choice(name="Standard", value="STANDARD"),
-                                    app_commands.Choice(name="Ranked", value="RANKED")])
-    @app_commands.describe(options="Ranked answers separated by |, in fixed fallback order (2–20 answers)")
     async def vote_submit(self, interaction: discord.Interaction, question: str,
                           submitter: discord.Member | None = None, fid: str | None = None,
-                          vote_type: str = "STANDARD", options: str | None = None):
+                          answer1: str | None = None, answer2: str | None = None,
+                          answer3: str | None = None, answer4: str | None = None,
+                          answer5: str | None = None, answer6: str | None = None,
+                          answer7: str | None = None, answer8: str | None = None,
+                          answer9: str | None = None, answer10: str | None = None,
+                          answer11: str | None = None, answer12: str | None = None,
+                          answer13: str | None = None, answer14: str | None = None,
+                          answer15: str | None = None, answer16: str | None = None,
+                          answer17: str | None = None, answer18: str | None = None,
+                          answer19: str | None = None, answer20: str | None = None):
         await interaction.response.defer(ephemeral=True)
         try:
+            options = [answer for answer in (
+                answer1, answer2, answer3, answer4, answer5, answer6, answer7, answer8,
+                answer9, answer10, answer11, answer12, answer13, answer14, answer15,
+                answer16, answer17, answer18, answer19, answer20) if answer is not None]
+            if len(options) == 1:
+                raise ValueError("Supply no answers for yes/no, two for a choice, or 3–20 for ranked voting.")
+            vote_type = "RANKED" if len(options) > 2 else "STANDARD"
             if len(question) > 1000:
                 raise ValueError("Questions must be at most 1000 characters.")
             if submitter and fid:
@@ -823,7 +868,7 @@ class Council(commands.Cog):
             alliance = storage.alliance_row(aid)
             async with self.lock:
                 vote_id = self.store.submit(interaction.guild_id, question, aid, player["fid"], interaction.user.id,
-                                            vote_type=vote_type, options=options.split("|") if options else None)
+                                            vote_type=vote_type, options=options)
                 self.store.set_identity(vote_id, resolved_tag or (alliance["abbr"] if alliance else "?"),
                                         player["nickname"], player["discord_id"])
             await interaction.followup.send(f"Vote #{vote_id} added to the queue (DEFINED).", ephemeral=True)
@@ -898,10 +943,10 @@ class Council(commands.Cog):
                 raise ValueError("This manual ballot belongs to another administrator.")
             self.require_admin(interaction)
             async with self.lock:
-                self.vote_for(interaction, vote_id)
+                vote = self.vote_for(interaction, vote_id)
                 self.store.cast(vote_id, alliance_id, answer, fid, actor, manual=True, reason=reason)
             await interaction.followup.send(
-                f"Manual ballot recorded for alliance {alliance_id}. Answer: {safe(answer)}\n"
+                f"Manual ballot recorded for alliance {alliance_id}. Answer: {self.answer_label(vote, answer)}\n"
                 f"Reason: {safe(reason)}", ephemeral=True)
             return True
         except ValueError as exc:
@@ -956,7 +1001,7 @@ class Council(commands.Cog):
             else:
                 view = ManualVoteView(self, vote, interaction.user.id, alliance_id, manual)
                 embed = discord.Embed(title=f"Manual ballot - {vote['title']}",
-                                      description="Select Yes, No or Abstain. Opening this panel does not record a ballot.")
+                                      description="Select an answer or Abstain. Opening this panel does not record a ballot.")
             embed.add_field(name="Manual entry", value=f"Alliance ID: {alliance_id}\nReason: {safe(reason)}"[:1024], inline=False)
             await interaction.followup.send(embed=embed, view=view, ephemeral=True)
         except ValueError as exc:
@@ -1000,8 +1045,13 @@ class Council(commands.Cog):
                 raise ValueError("No pending vote.")
             result = self.store.preview(vote["id"])
             if vote["status"] == "OPEN" and not result.early_conclusion:
-                raise ValueError("Early conclusion requires Yes/first-choice support > half of all eligible alliances.")
+                raise ValueError("Early conclusion requires Yes, either choice, or a ranked first choice to have support > half of all eligible alliances.")
             details = ""
+            if vote["vote_type"] == "STANDARD" and json.loads(vote["options"]):
+                groups = self.store.participation(vote["id"])
+                if result.status == "SELECTED":
+                    winner = json.loads(vote["options"])[0 if len(groups["YES"]) > len(groups["NO"]) else 1]
+                    details = f" Selected answer: **{safe(winner)}**."
             if vote["vote_type"] == "RANKED":
                 if result.winner:
                     details = f" Winner: **{safe(json.loads(vote['options'])[result.winner - 1])}**."
