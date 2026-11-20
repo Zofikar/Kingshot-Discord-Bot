@@ -62,6 +62,23 @@ def test_ballot_validation_and_early_conclusion(tmp_path):
     assert store.conclude(vote_id, 99, now=5) == "PASSED"
 
 
+def test_unreachable_yes_majority_allows_early_conclusion(tmp_path):
+    from extension.vote_storage import VoteStore
+    store = VoteStore(str(tmp_path / "votes.sqlite"))
+    vote_id = store.submit(1, "Question", 7, 100, 42, now=1)
+    store.open_next(1, [{"aid": aid, "abbr": str(aid)} for aid in range(10)], now=2)
+    for aid in range(4):
+        store.cast(vote_id, aid, "NO", 100, 42, now=3)
+    with pytest.raises(ValueError, match="majority"):
+        store.conclude(vote_id, 99, now=4)
+    store.cast(vote_id, 4, "ABSTAINED", 100, 42, now=5)
+    assert not store.preview(vote_id).early_conclusion
+    store.cast(vote_id, 5, "ABSTAINED", 100, 42, now=5)
+    assert store.preview(vote_id).early_conclusion
+    assert store.conclude(vote_id, 99, now=6) == "FAILED"
+    assert store.get(vote_id)["status"] == "FAILED"
+
+
 def test_urgency_restore_and_durable_delivery_metadata(tmp_path):
     from extension.vote_storage import VoteStore
     store = VoteStore(str(tmp_path / "votes.sqlite"))
@@ -87,7 +104,15 @@ def test_urgency_restore_and_durable_delivery_metadata(tmp_path):
     (20, 1, 0, 8, "PASSED", False),
     (20, 10, 0, 0, "PASSED", False),
     (20, 11, 0, 0, "PASSED", True),
-    (1, 0, 0, 1, "FAILED", False),
+    (20, 0, 10, 0, "FAILED", True),
+    (20, 0, 11, 0, "FAILED", True),
+    (20, 1, 10, 0, "FAILED", True),
+    (20, 0, 9, 0, "FAILED", False),
+    (10, 0, 4, 1, "FAILED", False),
+    (10, 0, 4, 2, "FAILED", True),
+    (10, 2, 4, 2, "FAILED", True),
+    (10, 3, 3, 4, "FAILED", True),
+    (1, 0, 0, 1, "FAILED", True),
 ])
 def test_tally_boundaries(eligible, yes, no, abstained, status, early):
     result = tally(eligible, yes, no, abstained)

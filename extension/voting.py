@@ -118,7 +118,10 @@ def tally(eligible: int, yes: int, no: int, abstained: int) -> Tally:
         raise ValueError("Invalid electorate or ballot counts.")
     status = "VOIDED" if 100 * cast < 45 * eligible else (
         "PASSED" if yes > no else "FAILED")
-    return Tally(status, 2 * yes > eligible, eligible - cast)
+    remaining = eligible - cast
+    # A tie fails too: even every outstanding ballot voting Yes cannot pass.
+    failure_locked = status == "FAILED" and yes + remaining <= no
+    return Tally(status, 2 * yes > eligible or failure_locked, remaining)
 
 
 @dataclass(frozen=True)

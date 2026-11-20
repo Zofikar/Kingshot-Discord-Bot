@@ -297,7 +297,7 @@ class VoteStore:
                 raise ValueError("Vote is not pending.")
             result = self._tally(conn, vote)
             if vote["status"] == "OPEN" and not result.early_conclusion:
-                raise ValueError("An absolute majority for Yes, either choice, or a ranked first choice is required to conclude early.")
+                raise ValueError("An absolute majority for Yes, either custom choice, or a ranked first choice, or an unreachable Yes majority in a Yes/No vote is required to conclude early.")
             conn.execute("UPDATE votes SET status=?,concluded_by=?,concluded_at=? "
                          "WHERE id=?", (result.status, actor, now, vote_id))
             if vote["vote_type"] == "RANKED":
