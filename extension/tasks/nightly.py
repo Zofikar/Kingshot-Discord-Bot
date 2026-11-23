@@ -154,6 +154,9 @@ class NightlyTasks(commands.Cog):
         # Player names/roles do not affect the NAP ranking. Run them after the
         # alliance lock is released so the 00:05 UTC post can proceed as soon as
         # its authoritative alliance snapshot is complete.
+        blacklist = self.bot.get_cog("Blacklist") if hasattr(self.bot, "get_cog") else None
+        if blacklist is not None:
+            await blacklist.refresh(notify=triggered_by == "scheduler")
         player_sync = await self._sync_linked_players()
         logger.info(
             "Nightly player sync done (trigger=%s, players_synced=%s, players_skipped=%s)",

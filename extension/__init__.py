@@ -69,6 +69,8 @@ async def setup(bot):
     from .cogs.nap_breaking import NapBreaking
     from .tasks.nightly import NightlyTasks
     from .cogs.council import Council
+    from .cogs.blacklist import Blacklist
+    await bot.add_cog(Blacklist(bot))
     await bot.add_cog(Settings(bot))
     await bot.add_cog(Nap(bot))
     await bot.add_cog(IDChannel(bot))

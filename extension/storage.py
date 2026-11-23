@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS alliance_list (
 """
 
 NAP_SCHEMA = """
+CREATE TABLE IF NOT EXISTS player_blacklist (
+    fid TEXT PRIMARY KEY,
+    record_json TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS nap_breakings (
     breaking_id TEXT PRIMARY KEY,
     record_json TEXT NOT NULL
