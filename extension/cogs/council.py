@@ -490,7 +490,7 @@ class Council(commands.Cog):
 
     async def channel(self, channel_id):
         if not channel_id:
-            raise ValueError("Configure the required vote channel with /admin_setting first.")
+            raise ValueError("Configure the required vote channel in /settings → Extension Settings first.")
         return self.bot.get_channel(channel_id) or await self.bot.fetch_channel(channel_id)
 
     async def start_next(self, guild):

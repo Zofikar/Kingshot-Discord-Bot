@@ -137,7 +137,7 @@ class MainMenu(commands.Cog):
 
     def build_main_menu_embed(self) -> discord.Embed:
         """Single source of truth for the top-level Settings Menu embed."""
-        return discord.Embed(
+        embed = discord.Embed(
             title=f"{theme.settingsIcon} Settings Menu",
             description=(
                 f"Welcome to the bot settings. Select a category to get started:\n\n"
@@ -165,6 +165,9 @@ class MainMenu(commands.Cog):
             ),
             color=theme.emColor1,
         )
+        for entry in getattr(self.bot, "settings_menu_entries", {}).values():
+            embed.add_field(name=entry["label"], value=entry["description"], inline=False)
+        return embed
 
     async def show_main_menu(self, interaction: discord.Interaction):
         """Display the main settings menu - entry point for all navigation."""
@@ -517,6 +520,20 @@ class MainMenuView(discord.ui.View):
     def __init__(self, cog):
         super().__init__(timeout=None)
         self.cog = cog
+        # Optional contributions own their callbacks, authorization, and lifecycle.
+        for key, entry in getattr(cog.bot, "settings_menu_entries", {}).items():
+            button = discord.ui.Button(label=entry["label"], custom_id=key,
+                                       style=discord.ButtonStyle.secondary, row=3)
+
+            async def open_entry(interaction, entry_key=key):
+                current = getattr(cog.bot, "settings_menu_entries", {}).get(entry_key)
+                if current is None:
+                    await interaction.response.send_message("This settings module is unavailable.", ephemeral=True)
+                    return
+                await current["callback"](interaction)
+
+            button.callback = open_entry
+            self.add_item(button)
 
     @discord.ui.button(
         label="Alliances",
