@@ -77,6 +77,7 @@ class Blacklist(commands.Cog):
         await interaction.followup.send(describe(record), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
     @app_commands.command(name="unblacklist", description="Admin: remove a player's blacklist entry by FID.")
+    @app_commands.describe(fid="Select a blacklisted player or enter their FID; search by name, KD, or FID")
     async def unblacklist(self, interaction: discord.Interaction, fid: str):
         if not await self._admin(interaction):
             return
@@ -86,6 +87,29 @@ class Blacklist(commands.Cog):
         async with self.lock:
             removed = store.remove(fid)
         await interaction.followup.send("Player unblacklisted." if removed else "No blacklist entry found.", ephemeral=True)
+
+    @unblacklist.autocomplete("fid")
+    async def unblacklist_fid_autocomplete(self, interaction: discord.Interaction, current: str):
+        if not PermissionManager.is_admin(interaction.user.id)[0]:
+            return []
+
+        def choices():
+            query = current.strip().casefold()
+            results = []
+            for record in store.records():
+                fid = str(record["fid"])
+                player = record.get("player") or {}
+                name = str(player.get("nick_name") or "Unknown player")
+                kd = player.get("kid", "Unknown")
+                if query not in f"{player.get('nick_name') or ''} {kd} {fid}".casefold():
+                    continue
+                suffix = f" | KD: {kd} | FID: {fid}"
+                results.append(app_commands.Choice(name=name[:100 - len(suffix)] + suffix, value=fid))
+                if len(results) == 25:
+                    break
+            return results
+
+        return await asyncio.to_thread(choices)
 
     async def _refresh(self, record, *, force_refresh=True):
         player = None

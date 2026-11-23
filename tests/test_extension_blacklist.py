@@ -70,6 +70,52 @@ def test_commands_deny_non_admins(monkeypatch):
     assert interaction.followup.send.await_count == 2
 
 
+@pytest.mark.parametrize("query, expected", [
+    ("", ["123", "456", "789"]),
+    (" PLAYER ", ["123"]),
+    ("23", ["123"]),
+    ("82", ["456"]),
+    ("missing", []),
+])
+def test_unblacklist_autocomplete_search(db, monkeypatch, query, expected):
+    monkeypatch.setattr(cog_mod.PermissionManager, "is_admin", lambda uid: (True,))
+    store.save({"fid": "123", "player": {"nick_name": "Player", "kid": 7}})
+    store.save({"fid": "456", "player": {"nick_name": "Expired", "kid": 82},
+                "ends_at": "2020-01-01T00:00:00+00:00"})
+    store.save({"fid": "789"})
+    interaction = SimpleNamespace(user=SimpleNamespace(id=1))
+    cog = cog_mod.Blacklist(SimpleNamespace())
+    parameter = cog_mod.Blacklist.unblacklist.get_parameter("fid")
+    assert parameter.autocomplete
+    choices = asyncio.run(cog.unblacklist_fid_autocomplete(interaction, query))
+    assert [choice.value for choice in choices] == expected
+    if not query:
+        assert choices[0].name == "Player | KD: 7 | FID: 123"
+        assert choices[2].name == "Unknown player | KD: Unknown | FID: 789"
+
+
+def test_unblacklist_autocomplete_denies_non_admins(monkeypatch):
+    monkeypatch.setattr(cog_mod.PermissionManager, "is_admin", lambda uid: (False,))
+    def unexpected_records():
+        pytest.fail("Non-admin autocomplete must not read blacklist records")
+    monkeypatch.setattr(store, "records", unexpected_records)
+    cog = cog_mod.Blacklist(SimpleNamespace())
+    interaction = SimpleNamespace(user=SimpleNamespace(id=1))
+    assert asyncio.run(cog.unblacklist_fid_autocomplete(interaction, "")) == []
+
+
+def test_unblacklist_autocomplete_limits(db, monkeypatch):
+    monkeypatch.setattr(cog_mod.PermissionManager, "is_admin", lambda uid: (True,))
+    for fid in range(1, 31):
+        store.save({"fid": str(fid), "player": {"nick_name": "X" * 150, "kid": 7}})
+    cog = cog_mod.Blacklist(SimpleNamespace())
+    interaction = SimpleNamespace(user=SimpleNamespace(id=1))
+    choices = asyncio.run(cog.unblacklist_fid_autocomplete(interaction, ""))
+    assert len(choices) == 25
+    assert all(len(choice.name) == 100 for choice in choices)
+    assert all(choice.name.endswith(f"FID: {choice.value}") for choice in choices)
+
+
 @pytest.mark.parametrize("records", [[], [{"fid": "123", "reason": "test", "ends_at": None}]])
 def test_list_available_to_non_admins(monkeypatch, records):
     def unexpected_admin_check(uid):
