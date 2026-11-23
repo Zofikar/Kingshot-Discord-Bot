@@ -303,7 +303,12 @@ async def fetch_player_data(
         force_refresh: bool = False,
         bypass_local_cache: bool = False,
 ) -> dict | str | None:
-    """Fetch player by Governor ID with local cache + stale-refresh handling."""
+    """Fetch player by Governor ID with local cache + stale-refresh handling.
+
+    force_refresh skips the local cache and forces a site refresh if public
+    data is stale. bypass_local_cache skips only the local cache. Both still
+    populate it when trustworthy data is returned.
+    """
     gid = str(gid)
 
     if not force_refresh and not bypass_local_cache:
@@ -312,7 +317,13 @@ async def fetch_player_data(
             print(f"[LOCAL CACHE] player gid={gid} HIT")
             return cached
 
-    print(f"[LOCAL CACHE] player gid={gid} MISS")
+    if force_refresh or bypass_local_cache:
+        print(
+            f"[LOCAL CACHE] player gid={gid} BYPASS "
+            f"force_refresh={int(force_refresh)} bypass_local_cache={int(bypass_local_cache)}"
+        )
+    else:
+        print(f"[LOCAL CACHE] player gid={gid} MISS")
     envelope = await fetch_player_envelope(gid)
     if envelope in ("NOT_FOUND", "RATE_LIMITED") or envelope is None:
         return envelope

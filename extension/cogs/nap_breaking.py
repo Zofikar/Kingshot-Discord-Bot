@@ -152,8 +152,8 @@ class NapBreaking(commands.Cog):
             return
 
         attacker, attacked = await asyncio.gather(
-            mightpulse.fetch_player_data(attacker_gid, force_refresh=True, bypass_local_cache=True),
-            mightpulse.fetch_player_data(attacked_gid, force_refresh=True, bypass_local_cache=True),
+            mightpulse.fetch_player_data(attacker_gid),
+            mightpulse.fetch_player_data(attacked_gid),
         )
         errors = {"NOT_FOUND": "was not found", "RATE_LIMITED": "is rate-limited",
                   None: "could not be refreshed with trustworthy data"}

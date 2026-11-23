@@ -29,7 +29,7 @@ def accounts(tmp_path, monkeypatch):
     }
 
     async def fetch(gid, **kwargs):
-        assert kwargs == {"force_refresh": True}
+        assert kwargs in ({}, {"force_refresh": True})
         return players[str(gid)]
 
     monkeypatch.setattr(identity.mightpulse, "fetch_player_data", fetch)
@@ -63,6 +63,25 @@ def verify(accounts, fid, member=None):
     inter.followup.send.assert_awaited_once_with(
         f"Linked and synced ID `{fid}`.", ephemeral=True)
     return inter
+
+
+@pytest.mark.parametrize("command, kwargs, expected_flags", [
+    ("verify", {"gid": "100"}, {}),
+    ("register", {"gid": "100"}, {}),
+    ("admin_bind", {"gid": "100"}, {}),
+    ("refresh", {}, {"force_refresh": True}),
+    ("admin_refresh", {}, {"force_refresh": True}),
+])
+def test_identity_player_cache_policy(accounts, monkeypatch, command, kwargs, expected_flags):
+    monkeypatch.setattr(identity.PermissionManager, "is_admin", lambda uid: (True,))
+    monkeypatch.setattr(identity.storage, "main_fid_for_discord", lambda uid: "100")
+    fetch = AsyncMock(return_value=None)
+    monkeypatch.setattr(identity.mightpulse, "fetch_player_data", fetch)
+    if command in ("admin_bind", "admin_refresh"):
+        kwargs = {**kwargs, "member": accounts.member}
+    asyncio.run(getattr(identity.IdentityMightpulse, command).callback(
+        accounts.live, interaction(accounts.member), **kwargs))
+    fetch.assert_awaited_once_with("100", **expected_flags)
 
 
 def test_verify_two_accounts_keeps_first_main_and_uses_only_its_roles(accounts):

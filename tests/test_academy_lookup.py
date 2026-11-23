@@ -9,6 +9,30 @@ from extension.cogs import nap
 from extension.nap import NapLogic
 
 
+def test_gid_lookup_allows_local_player_cache(monkeypatch):
+    fetch = AsyncMock(return_value={"kid": 245, "alliance": {"aid": 20}})
+    monkeypatch.setattr(nap.mightpulse, "fetch_player_data", fetch)
+    monkeypatch.setattr(nap.storage, "upsert_alliance", Mock())
+    assert asyncio.run(nap._resolve_aid_from_gid("123")) == 20
+    fetch.assert_awaited_once_with("123")
+
+
+def test_nap_breaking_player_lookups_allow_cache(monkeypatch):
+    from extension.cogs import nap_breaking
+
+    fetch = AsyncMock(return_value=None)
+    monkeypatch.setattr(nap_breaking.mightpulse, "fetch_player_data", fetch)
+    monkeypatch.setattr(nap_breaking, "_settings", lambda bot: SimpleNamespace(get_int=lambda key: 1))
+    interaction = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()),
+                                  followup=SimpleNamespace(send=AsyncMock()))
+    cog = nap_breaking.NapBreaking(SimpleNamespace())
+    asyncio.run(nap_breaking.NapBreaking.nap_breaking.callback(
+        cog, interaction, attacker_gid="123", attacked_gid="456"))
+    assert fetch.await_count == 2
+    assert [call.args for call in fetch.await_args_list] == [("123",), ("456",)]
+    assert all(not call.kwargs for call in fetch.await_args_list)
+
+
 @pytest.fixture
 def lookup(monkeypatch):
     monkeypatch.setattr(nap.storage, "alliance_row", lambda aid: {"kid": 245})

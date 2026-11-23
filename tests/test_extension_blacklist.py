@@ -82,8 +82,50 @@ def test_list_available_to_non_admins(monkeypatch, records):
     cog.refresh = AsyncMock(return_value=records)
     asyncio.run(cog_mod.Blacklist.blacklist_list.callback(cog, interaction))
     interaction.response.defer.assert_awaited_once_with(ephemeral=True)
-    cog.refresh.assert_awaited_once_with()
+    cog.refresh.assert_awaited_once_with(force_refresh=False)
     interaction.followup.send.assert_awaited_once()
     assert interaction.followup.send.call_args.kwargs["ephemeral"] is True
     content = interaction.followup.send.call_args.args[0]
     assert ("123" in content) if records else (content == "No active blacklisted players.")
+
+
+def test_list_reuses_local_player_cache(db, monkeypatch):
+    store.save({"fid": "123", "reason": "test", "ends_at": None})
+    monkeypatch.setattr(cog_mod.mightpulse, "available", lambda: True)
+    monkeypatch.setattr(cog_mod.mightpulse, "_PLAYER_CACHE", {})
+    monkeypatch.setattr(cog_mod.mightpulse._config, "player_cache_ttl_seconds", 900)
+    player = {"nick_name": "Cached player", "kid": 7}
+    cog_mod.mightpulse.cache_player("123", player)
+    fetch = AsyncMock()
+    monkeypatch.setattr(cog_mod.mightpulse, "fetch_player_envelope", fetch)
+    interaction = SimpleNamespace(response=SimpleNamespace(defer=AsyncMock()),
+                                  followup=SimpleNamespace(send=AsyncMock()))
+    cog = cog_mod.Blacklist(SimpleNamespace())
+
+    for _ in range(2):
+        asyncio.run(cog_mod.Blacklist.blacklist_list.callback(cog, interaction))
+
+    fetch.assert_not_awaited()
+    assert store.records()[0]["player"] == player
+    assert not store.records()[0]["refresh_failed"]
+    assert interaction.followup.send.await_count == 2
+
+
+@pytest.mark.parametrize("by_name", [False, True])
+def test_adding_player_bypasses_cache_only_for_name_and_kd(db, monkeypatch, by_name):
+    monkeypatch.setattr(cog_mod.PermissionManager, "is_admin", lambda uid: (True,))
+    monkeypatch.setattr(cog_mod.mightpulse, "available", lambda: True)
+    fetch = AsyncMock(return_value={"nick_name": "Fresh player"})
+    monkeypatch.setattr(cog_mod.mightpulse, "fetch_player_data", fetch)
+    interaction = SimpleNamespace(user=SimpleNamespace(id=1),
+                                  response=SimpleNamespace(defer=AsyncMock()),
+                                  followup=SimpleNamespace(send=AsyncMock()))
+    cog = cog_mod.Blacklist(SimpleNamespace())
+    monkeypatch.setattr(store, "find_fids", lambda kd, name: ["123"])
+
+    asyncio.run(cog_mod.Blacklist.blacklist.callback(
+        cog, interaction, reason="test",
+        **({"kd": 7, "player_name": "Fresh player"} if by_name else {"fid": "123"})))
+
+    fetch.assert_awaited_once_with("123", force_refresh=by_name, bypass_local_cache=by_name)
+    assert store.records()[0]["player"]["nick_name"] == "Fresh player"

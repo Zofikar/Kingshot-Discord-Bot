@@ -49,6 +49,7 @@ class Blacklist(commands.Cog):
                         player_name: str | None = None, ends_at: str | None = None):
         if not await self._admin(interaction):
             return
+        force_refresh = fid is None
         try:
             expiry = store.parse_end(ends_at)
             if not reason.strip() or len(reason) > 1000:
@@ -71,7 +72,7 @@ class Blacklist(commands.Cog):
         async with self.lock:
             record = {"fid": fid, "reason": reason.strip(), "ends_at": expiry,
                       "added_by": interaction.user.id, "added_at": datetime.now(timezone.utc).isoformat()}
-            await self._refresh(record)
+            await self._refresh(record, force_refresh=force_refresh)
             store.save(record)
         await interaction.followup.send(describe(record), ephemeral=True, allowed_mentions=discord.AllowedMentions.none())
 
@@ -86,11 +87,12 @@ class Blacklist(commands.Cog):
             removed = store.remove(fid)
         await interaction.followup.send("Player unblacklisted." if removed else "No blacklist entry found.", ephemeral=True)
 
-    async def _refresh(self, record):
+    async def _refresh(self, record, *, force_refresh=True):
         player = None
         try:
             if mightpulse.available():
-                player = await mightpulse.fetch_player_data(record["fid"], force_refresh=True, bypass_local_cache=True)
+                player = await mightpulse.fetch_player_data(
+                    record["fid"], force_refresh=force_refresh, bypass_local_cache=force_refresh)
         except Exception:
             logger.exception("Blacklist refresh failed for FID %s", record["fid"])
         record["refresh_failed"] = not isinstance(player, dict)
@@ -98,13 +100,13 @@ class Blacklist(commands.Cog):
             record["player"] = player
             record["refreshed_at"] = datetime.now(timezone.utc).isoformat()
 
-    async def refresh(self, *, notify=False):
+    async def refresh(self, *, notify=False, force_refresh=True):
         async with self.lock:
             result = []
             for record in store.records():
                 if not store.active(record):
                     continue
-                await self._refresh(record)
+                await self._refresh(record, force_refresh=force_refresh)
                 store.save(record)
                 result.append(record)
             if notify:
@@ -140,7 +142,7 @@ class Blacklist(commands.Cog):
     @app_commands.command(name="blacklist_list", description="Refresh and list all active blacklisted players.")
     async def blacklist_list(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        records = await self.refresh()
+        records = await self.refresh(force_refresh=False)
         if not records:
             await interaction.followup.send("No active blacklisted players.", ephemeral=True)
         for record in records:

@@ -50,7 +50,7 @@ def _save_nap(logic, nap_state):
 
 async def _resolve_aid_from_gid(gid):
     """Resolve an alliance aid from a member GID (or return an error string)."""
-    player = await mightpulse.fetch_player_data(gid, force_refresh=True)
+    player = await mightpulse.fetch_player_data(gid)
     if not isinstance(player, dict):
         return f"Could not fetch Governor ID `{gid}`."
     alliance = player.get("alliance") or {}

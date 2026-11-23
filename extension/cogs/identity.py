@@ -422,7 +422,7 @@ class IdentityMightpulse(commands.Cog):
             await interaction.followup.send(ownership_denial, ephemeral=True)
             return
         settings = _settings(self.bot)
-        player = await mightpulse.fetch_player_data(gid, force_refresh=True)
+        player = await mightpulse.fetch_player_data(gid)
         if not isinstance(player, dict):
             reason = _LOOKUP_ERRORS.get(player, "could not be refreshed")
             await interaction.followup.send(f"That ID {reason}.", ephemeral=True)
@@ -492,7 +492,7 @@ class IdentityMightpulse(commands.Cog):
             await interaction.followup.send("You don't have admin permission.", ephemeral=True)
             return
         settings = _settings(self.bot)
-        player = await mightpulse.fetch_player_data(gid, force_refresh=True)
+        player = await mightpulse.fetch_player_data(gid)
         if not isinstance(player, dict):
             reason = _LOOKUP_ERRORS.get(player, "could not be refreshed")
             await interaction.followup.send(f"That ID {reason}.", ephemeral=True)
