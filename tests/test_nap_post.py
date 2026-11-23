@@ -36,6 +36,9 @@ class _FakeSettings:
     def get_json(self, key, default=None):
         return self._values.get(key, default)
 
+    def set_json(self, key, value):
+        self._values[key] = value
+
 
 class _FakeChannel:
     def __init__(self, error=None):
@@ -104,6 +107,76 @@ def test_post_ranking_records_snapshot(tmp_path, monkeypatch):
     assert "1. [A10] N10 - 300" in channel.messages[0]
     # The posted snapshot is persisted, so a later lookback can protect it.
     assert [e["aid"] for e in storage.nap_lookback_protected(7, db_dir=str(tmp_path))] == [10, 11]
+
+
+def test_unchanged_tags_skip_leaders_post_but_not_ranking(tmp_path, monkeypatch):
+    channel = _FakeChannel()
+    bot = _prepare(monkeypatch, tmp_path, channel=channel,
+                   settings={"leaders_nap_post_channel": 456})
+
+    assert asyncio.run(nap_cog.post_nap_ranking(bot)) is True
+    assert asyncio.run(nap_cog.post_nap_ranking(bot)) is True
+    assert len(channel.messages) == 3
+    assert channel.messages[1] == "A10 A11"
+
+
+def test_leaders_tag_baseline_survives_restart_and_ignores_order(tmp_path):
+    from extension.settings import SettingsStore
+
+    db_path = str(tmp_path / "settings.sqlite")
+    settings = SettingsStore(db_path)
+    settings.set("leaders_nap_post_channel", 456)
+    channel = _FakeChannel()
+    bot = _FakeBot(channel, {})
+    bot.extension_settings = settings
+    logic = _logic()
+    ranking = [{"aid": 10, "abbr": "A10"}, {"aid": 11, "abbr": "A11"}]
+
+    assert asyncio.run(nap_cog._post_nap_tag_list(bot, logic, ranking, {}, [])) is True
+    restarted = _FakeBot(channel, {})
+    restarted.extension_settings = SettingsStore(db_path)
+    assert asyncio.run(nap_cog._post_nap_tag_list(
+        restarted, logic, list(reversed(ranking)), {}, [])) is False
+    assert channel.messages == ["A10 A11"]
+
+
+@pytest.mark.parametrize("change", ["added", "removed", "renamed", "academy", "lookback", "channel"])
+def test_changed_leaders_tags_are_posted(change):
+    channel = _FakeChannel()
+    bot = _FakeBot(channel, {"leaders_nap_post_channel": 456})
+    logic = _logic()
+    ranking = [{"aid": 10, "abbr": "A10"}, {"aid": 11, "abbr": "A11"}]
+    assert asyncio.run(nap_cog._post_nap_tag_list(bot, logic, ranking, {}, [])) is True
+    academies, fallen = {}, []
+    if change == "added":
+        ranking.append({"aid": 12, "abbr": "NEW"})
+    elif change == "removed":
+        ranking.pop()
+    elif change == "renamed":
+        ranking[0]["abbr"] = "NEW"
+    elif change == "academy":
+        academies["10"] = "AC"
+    elif change == "lookback":
+        fallen.append({"aid": 12, "abbr": "OLD"})
+    else:
+        bot.extension_settings._values["leaders_nap_post_channel"] = 789
+
+    assert asyncio.run(nap_cog._post_nap_tag_list(bot, logic, ranking, academies, fallen)) is True
+    assert len(channel.messages) == 2
+
+
+def test_failed_leaders_post_is_retried():
+    error = discord.Forbidden(types.SimpleNamespace(status=403, reason="Forbidden"), "nope")
+    channel = _FakeChannel(error=error)
+    bot = _FakeBot(channel, {"leaders_nap_post_channel": 456})
+    logic = _logic()
+    ranking = [{"aid": 10, "abbr": "A10"}]
+
+    assert asyncio.run(nap_cog._post_nap_tag_list(bot, logic, ranking, {}, [])) is False
+    assert bot.extension_settings.get_json("leaders_nap_post_tags.456") is None
+    channel.error = None
+    assert asyncio.run(nap_cog._post_nap_tag_list(bot, logic, ranking, {}, [])) is True
+    assert channel.messages == ["A10"]
 
 
 @pytest.mark.parametrize("days", [0, 7])

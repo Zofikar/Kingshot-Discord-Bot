@@ -152,11 +152,19 @@ async def post_nap_ranking(bot, *, triggered_by="scheduler"):
 
 
 async def _post_nap_tag_list(bot, logic, ranking, academy_tags, fallen, *, triggered_by="scheduler"):
-    leaders_channel_id = _settings(bot).get_int("leaders_nap_post_channel")
+    settings = _settings(bot)
+    leaders_channel_id = settings.get_int("leaders_nap_post_channel")
     if not leaders_channel_id:
         return False
     tags = logic.build_nap_tag_list(ranking, academy_tags, fallen)
     if not tags:
+        return False
+    # Ranking order/power changes do not change which tags are NAP-protected.
+    # Keep a successful-post baseline per destination, including across restarts.
+    state_key = f"leaders_nap_post_tags.{leaders_channel_id}"
+    tag_membership = sorted(set(tags))
+    if settings.get_json(state_key) == tag_membership:
+        logger.info("Skipped unchanged NAP tag list (trigger=%s)", triggered_by)
         return False
     message = nap_mod.NapLogic.build_nap_tag_message(tags)
     try:
@@ -167,6 +175,7 @@ async def _post_nap_tag_list(bot, logic, ranking, academy_tags, fallen, *, trigg
     except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
         logger.warning("Could not post NAP tag list to channel %s: %s", leaders_channel_id, e)
         return False
+    settings.set_json(state_key, tag_membership)
     logger.info("Posted NAP tag list (trigger=%s)", triggered_by)
     return True
 
