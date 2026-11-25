@@ -11,6 +11,12 @@ from pathlib import Path
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def isolated_mightpulse_quotas(monkeypatch):
+    from extension.providers import mightpulse_api
+    monkeypatch.setattr(mightpulse_api, "_ACCOUNT_LIMITS", {})
+
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
 for _p in (str(_REPO), str(_HERE)):
