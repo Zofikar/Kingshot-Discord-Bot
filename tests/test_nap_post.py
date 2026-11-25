@@ -62,6 +62,11 @@ class _FakeBot:
     def get_channel(self, channel_id):
         return self._channel
 
+    def get_cog(self, name):
+        if name == "NightlyTasks":
+            return types.SimpleNamespace(snapshot_ready_for_publication=lambda: True)
+        return None
+
     async def fetch_channel(self, channel_id):
         return self._channel
 
@@ -77,6 +82,17 @@ class _StorageShim:
 
     def record_nap_ranking(self, ranked, *, posted_at=None):
         return storage.record_nap_ranking(ranked, posted_at=posted_at, db_dir=self._db_dir)
+
+
+@pytest.mark.parametrize("checks", [[False], [True, False]])
+def test_scheduled_post_rejects_expired_snapshot(tmp_path, monkeypatch, checks):
+    channel = _FakeChannel()
+    bot = _prepare(monkeypatch, tmp_path, channel=channel)
+    outcomes = iter(checks)
+    guard = types.SimpleNamespace(snapshot_ready_for_publication=lambda: next(outcomes))
+    bot.get_cog = lambda name: guard
+    assert asyncio.run(nap_cog.post_nap_ranking(bot)) is False
+    assert channel.messages == []
 
 
 def _logic():

@@ -1,7 +1,7 @@
 """Data providers for the extension.
 
-``mightpulse`` supplies live player/alliance/kingdom-ranking data (Bearer API +
-site-scrape refresh fallback) — the data source the upstream bot lost when the
+``mightpulse`` supplies live player/alliance/kingdom-ranking data (Bearer API
+with API-managed refreshes) — the data source the upstream bot lost when the
 game removed its player API. It is the extension's only live game-data source.
 """
 

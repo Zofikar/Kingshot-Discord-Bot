@@ -1,6 +1,9 @@
 """Scheduled tasks: nightly maintenance + daily NAP post (MightPulse-gated)."""
 import logging
-from datetime import time, timezone
+import asyncio
+import math
+import time as time_module
+from datetime import datetime, time, timezone
 
 import discord
 from discord import app_commands
@@ -41,6 +44,9 @@ class NightlyTasks(commands.Cog):
         # report what actually reached Discord.
         self.last_tag_sync = {"linked": 0, "retagged": 0}
         self.last_player_sync = {"synced": 0, "skipped": 0}
+        self.last_alliance_refresh_failures = None
+        self.last_alliance_snapshot_date = None
+        self.alliance_snapshot_times = {}
 
     async def cog_load(self):
         if mightpulse.available():
@@ -88,13 +94,18 @@ class NightlyTasks(commands.Cog):
         except ValueError:
             mult = 2.0
         candidate_count = min(max(count, int(round(count * max(1.0, mult)))), 100)
+        self._discovered_power = {}
         candidates = await mightpulse.fetch_kingdom_alliance_power_ranking(kid, limit=candidate_count)
         if not candidates:
             return 0
+        previous_power = {str(row["alliance_id"]): row["power"] for row in storage.all_alliances()}
         for alliance in candidates[:candidate_count]:
+            self._discovered_power[str(alliance["aid"])] = alliance["power"]
             storage.upsert_alliance(
                 alliance.get("aid"), abbr=alliance.get("abbr"), name=alliance.get("name"),
-                kid=kid, power=alliance.get("power"),
+                # Boards are discovery snapshots, not current alliance power.
+                # Keep an existing value if the subsequent refresh fails.
+                kid=kid, power=previous_power.get(str(alliance["aid"]), alliance.get("power")),
             )
         return min(len(candidates), candidate_count)
 
@@ -110,6 +121,11 @@ class NightlyTasks(commands.Cog):
             # kingdom board and would otherwise hide the rename. NAP state is
             # loaded lazily: no DB read at all when nothing was renamed.
             previous_tags = {row["alliance_id"]: row["abbr"] for row in storage.all_alliances()}
+            self._discovered_power = {}
+            self.last_alliance_refresh_failures = None
+            self.last_alliance_snapshot_date = None
+            self.alliance_snapshot_times = {}
+            refresh_failures = []
             rename_state = None
             discovered = await self._discover_candidates()
             for row in storage.all_alliances():
@@ -119,15 +135,18 @@ class NightlyTasks(commands.Cog):
                 # No stored tag is fine now: the refresh is keyed on the alliance
                 # id, which is what survives a rename.
                 if not kid:
+                    refresh_failures.append(str(aid))
                     continue
                 alliance, source = await mightpulse.fetch_current_alliance(
                     int(aid), kid=int(kid), tag=tag)
                 if not isinstance(alliance, dict):
+                    refresh_failures.append(str(aid))
                     logger.warning(
                         "Alliance update failed for aid=%s tag=%r source=%s; keeping previous snapshot value.",
                         aid, tag, source)
                     continue
                 new_tag = alliance.get("abbr")
+                self.alliance_snapshot_times[str(aid)] = alliance.get("snapshot_cached_at")
                 old_tag = previous_tags.get(aid) or tag
                 if new_tag and old_tag and str(old_tag).strip().upper() != str(new_tag).strip().upper():
                     if rename_state is None:
@@ -142,11 +161,16 @@ class NightlyTasks(commands.Cog):
                         aid, old_tag, new_tag)
                 storage.upsert_alliance(
                     aid, abbr=new_tag or tag, name=alliance.get("name") or tag,
-                    kid=alliance.get("kid") or kid, power=alliance.get("power"),
+                    kid=alliance.get("kid") or kid,
+                    # The board may be hours old; the refreshed info is newer.
+                    power=alliance.get("power"),
                 )
-            # The rows above are fresh; make Discord agree with them (role names
+            # Successful reads are recent; failed reads retain their old values.
+            # Make Discord agree with the stored rows (role names
             # and every member's `[TAG]` nickname prefix).
             resynced = await self._sync_alliance_discord_state()
+            self.last_alliance_refresh_failures = refresh_failures
+            self.last_alliance_snapshot_date = datetime.now(timezone.utc).date()
             logger.info(
                 "Nightly alliance snapshot done (trigger=%s, discovered=%s, members_resynced=%s)",
                 triggered_by, discovered, resynced)
@@ -343,7 +367,77 @@ class NightlyTasks(commands.Cog):
                 members.append(member)
         return members
 
+    def snapshot_ready_for_publication(self):
+        """Fail closed for missing, future, nonfinite or expired capture times."""
+        if (self.last_alliance_refresh_failures != []
+                or self.last_alliance_snapshot_date != datetime.now(timezone.utc).date()):
+            return False
+        rows = storage.all_alliances()
+        if not rows:
+            return False
+        now = time_module.time()
+        for row in rows:
+            try:
+                age = now - float(self.alliance_snapshot_times[str(row["alliance_id"])])
+                if not math.isfinite(age) or not -5 <= age <= mightpulse.NIGHTLY_PUBLICATION_MAX_AGE_SECONDS:
+                    return False
+            except (KeyError, TypeError, ValueError, OverflowError):
+                return False
+        return True
+
+    async def _recover_publication_snapshot(self):
+        """Retry unresolved/expired candidates, with a bounded recovery budget."""
+        async with self.bot.maintenance_lock:
+            failures = []
+            deadline = time_module.monotonic() + 120
+            for row in storage.all_alliances():
+                aid = str(row["alliance_id"])
+                try:
+                    age = time_module.time() - float(self.alliance_snapshot_times.get(aid))
+                    # Leave a minute of headroom for subsequent candidates.
+                    if math.isfinite(age) and -5 <= age <= 540:
+                        continue
+                except (TypeError, ValueError, OverflowError):
+                    pass
+                remaining = deadline - time_module.monotonic()
+                if remaining <= 0:
+                    failures.append(aid)
+                    continue
+                kid = row["kid"] or await self._primary_kid()
+                if not kid:
+                    failures.append(aid)
+                    continue
+                try:
+                    alliance, source = await asyncio.wait_for(
+                        mightpulse.fetch_current_alliance(int(aid), kid=int(kid), tag=row["abbr"]),
+                        timeout=remaining)
+                except asyncio.TimeoutError:
+                    alliance = None
+                if not isinstance(alliance, dict):
+                    failures.append(aid)
+                    continue
+                storage.upsert_alliance(
+                    aid, abbr=alliance.get("abbr") or row["abbr"],
+                    name=alliance.get("name") or row["name"], kid=alliance.get("kid") or kid,
+                    power=alliance.get("power"))
+                self.alliance_snapshot_times[aid] = alliance.get("snapshot_cached_at")
+            self.last_alliance_refresh_failures = failures
+
     async def _post_nap_ranking(self, *, triggered_by="scheduler"):
+        if triggered_by == "scheduler" and hasattr(self.bot, "maintenance_lock"):
+            # Wait for the alliance phase before examining its completion state.
+            async with self.bot.maintenance_lock:
+                pass
+        if (triggered_by == "scheduler"
+                and self.last_alliance_snapshot_date == datetime.now(timezone.utc).date()):
+            await self._recover_publication_snapshot()
+        if triggered_by == "scheduler" and (
+                self.last_alliance_refresh_failures != []
+                or self.last_alliance_snapshot_date != datetime.now(timezone.utc).date()):
+            logger.error(
+                "Refusing scheduled NAP post: reset snapshot is unverified or incomplete; failed alliances=%s",
+                self.last_alliance_refresh_failures)
+            return False
         from ..cogs.nap import post_nap_ranking
         return await post_nap_ranking(self.bot, triggered_by=triggered_by)
 

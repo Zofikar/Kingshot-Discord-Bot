@@ -18,7 +18,7 @@ def provider(monkeypatch):
     monkeypatch.setattr(mightpulse, "_PLAYER_CACHE", {})
     monkeypatch.setattr(mightpulse._config, "player_cache_ttl_seconds", 900)
     monkeypatch.setattr(mightpulse.time_module, "monotonic", lambda: clock[0])
-    fetch = AsyncMock(return_value={"fresh": True, "player": PLAYER})
+    fetch = AsyncMock(return_value={"ok": True, "fresh": True, "player": PLAYER})
     monkeypatch.setattr(mightpulse, "fetch_player_envelope", fetch)
     return clock, fetch
 
@@ -57,13 +57,10 @@ def test_explicit_refresh_logs_bypass_and_updates_cache(provider, capsys, flags)
     assert "MISS" not in output
 
 
-def test_site_refresh_populates_cache_for_next_read(provider, monkeypatch):
+def test_pending_refresh_does_not_populate_cache(provider):
     _, fetch = provider
-    fetch.return_value = {"fresh": False, "uid": PLAYER["uid"], "player": PLAYER}
-    refresh = AsyncMock(return_value=PLAYER)
-    monkeypatch.setattr(mightpulse, "refresh_site_player", refresh)
+    fetch.return_value = {"ok": True, "fresh": False, "refresh": "queued", "player": PLAYER}
 
-    assert asyncio.run(mightpulse.fetch_player_data(GID, force_refresh=True)) == PLAYER
-    assert asyncio.run(mightpulse.fetch_player_data(GID)) == PLAYER
+    assert asyncio.run(mightpulse.fetch_player_data(GID, force_refresh=True)) is None
+    assert mightpulse.get_cached_player(GID) is None
     fetch.assert_awaited_once_with(GID)
-    refresh.assert_awaited_once_with(PLAYER["uid"], force=True)

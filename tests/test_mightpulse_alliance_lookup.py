@@ -9,13 +9,14 @@ maintenance records the old tag as a historical alias.
 import asyncio
 import json as jsonlib
 import types
+import time
 
 import aiohttp
 import pytest
 
 from extension import nap as nap_mod
 from extension.cogs import nap as nap_cog
-from extension.providers import mightpulse
+from extension.providers import mightpulse, mightpulse_api
 from extension.tasks import nightly as nightly_mod
 
 AID = 247300011
@@ -23,21 +24,22 @@ KID = 2464
 OLD_TAG = "MNX"
 NEW_TAG = "TKO"
 
-AID_URL = f"https://api.mightpulse.com/v1/alliances/{AID}?include=info"
-TAG_URL = f"https://api.mightpulse.com/v1/alliances/{KID}/{OLD_TAG}?include=info"
+AID_URL = f"https://api.mightpulse.com/v1/alliances/{AID}?include=info&wait=30"
+TAG_URL = f"https://api.mightpulse.com/v1/alliances/{KID}/{OLD_TAG}?include=info&wait=30"
 STATUS_URL = f"https://mightpulse.com/api/alliances/{AID}/refresh/status"
 REFRESH_URL = f"https://mightpulse.com/api/alliances/{AID}/refresh?force=1&kid={KID}"
 PAGE_URL = f"https://mightpulse.com/{KID}/{OLD_TAG}"
 
 FRESH_ENVELOPE = {
     "ok": True, "aid": AID, "kid": KID, "tag": NEW_TAG, "fresh": True,
+    "age_seconds": 0, "cached_at": time.time(),
     "alliance": {
         "aid": AID, "name": "theknightsONE", "abbr": NEW_TAG, "kid": KID,
         "power": 1858681076,
     },
 }
 STALE_TAG_ENVELOPE = {
-    "ok": True, "aid": AID, "kid": KID, "tag": OLD_TAG,
+    "ok": True, "fresh": True, "aid": AID, "kid": KID, "tag": OLD_TAG,
     "alliance": {"aid": AID, "name": "FAMILLY", "abbr": OLD_TAG, "kid": KID,
                  "power": 1117021914},
 }
@@ -49,6 +51,7 @@ class _Resp:
         self.status = status
         self._payload = payload
         self.url = ""
+        self.headers = {}
 
     async def json(self):
         return self._payload
@@ -88,6 +91,10 @@ class _Session:
     def _call(self, method, url):
         self.calls.append((method, url))
         route = self._routes.get((method, url))
+        if route is None and url.endswith("&max_age=60"):
+            route = self._routes.get((method, url.removesuffix("&max_age=60")))
+        if isinstance(route, list):
+            return route.pop(0)
         return route if route is not None else _Resp(404, NOT_FOUND)
 
     def get(self, url, **_kwargs):
@@ -114,8 +121,11 @@ def _provider(monkeypatch):
         def ClientSession(**kwargs):
             return _Session(routes, calls, **kwargs)
 
-    monkeypatch.setattr(mightpulse, "aiohttp", _FakeAiohttp)
-    monkeypatch.setattr(mightpulse, "SITE_REFRESH_POLL_SECONDS", 0)
+    monkeypatch.setattr(mightpulse_api.aiohttp, "ClientSession", _FakeAiohttp.ClientSession)
+    async def no_sleep(_delay):
+        pass
+
+    monkeypatch.setattr(mightpulse_api.asyncio, "sleep", no_sleep)
     mightpulse.configure(types.SimpleNamespace(
         mightpulse_api_key="test-key",
         player_cache_ttl_seconds=900,
@@ -168,10 +178,10 @@ def test_current_alliance_uses_aid_when_stored_tag_is_stale(_provider):
     data, source = asyncio.run(
         mightpulse.fetch_current_alliance(AID, kid=KID, tag=OLD_TAG))
 
-    assert source == "official-api-recent"
+    assert source == "official-api"
     assert data["abbr"] == NEW_TAG
     assert data["power"] == 1858681076
-    assert ("GET", AID_URL) in _provider.calls
+    assert ("GET", AID_URL + "&max_age=60") in _provider.calls
     assert ("GET", TAG_URL) not in _provider.calls
 
 
@@ -183,41 +193,32 @@ def test_current_alliance_works_without_any_stored_tag(_provider):
 
     data, source = asyncio.run(mightpulse.fetch_current_alliance(AID, kid=KID, tag=None))
 
-    assert source == "official-api-recent"
+    assert source == "official-api"
     assert data["abbr"] == NEW_TAG
 
 
 def test_refresh_rereads_by_aid_and_detects_the_rename(_provider):
-    """A completed site refresh must not be discarded by a tag-keyed re-read."""
-    _provider.routes[("GET", PAGE_URL)] = _Resp(200, None)
-    _provider.routes[("POST", REFRESH_URL)] = _Resp(
-        200, {"ok": True, "queued": True, "alliance": STALE_TAG_ENVELOPE["alliance"]})
-    _provider.routes[("GET", STATUS_URL)] = _Resp(
-        200, {"ok": True, "cooldown_remaining_sec": 0, "queued": False, "started": False})
-    _provider.routes[("GET", AID_URL)] = _Resp(200, FRESH_ENVELOPE)
-    _provider.routes[("GET", TAG_URL)] = _Resp(404, NOT_FOUND)
-
-    data = asyncio.run(mightpulse.refresh_site_alliance(
-        AID, force=True, tag=OLD_TAG, bypass_local_cache=True))
-
+    _provider.routes[("GET", AID_URL)] = [
+        _Resp(200, {"ok": True, "fresh": False, "refresh": "queued",
+                    "alliance": STALE_TAG_ENVELOPE["alliance"], "retry_after": 1}),
+        _Resp(200, FRESH_ENVELOPE),
+    ]
+    data, source = asyncio.run(mightpulse.fetch_current_alliance(AID, kid=KID, tag=OLD_TAG))
     assert data["abbr"] == NEW_TAG
     assert data["power"] == 1858681076
-    assert ("POST", REFRESH_URL) in _provider.calls
-    assert ("GET", AID_URL) in _provider.calls
+    assert source == "official-api"
+    assert _provider.calls == [("GET", AID_URL + "&max_age=60")] * 2
 
 
-def test_refresh_still_refuses_stale_payload_when_refresh_never_completes(_provider, monkeypatch):
-    _provider.routes[("GET", PAGE_URL)] = _Resp(200, None)
-    _provider.routes[("POST", REFRESH_URL)] = _Resp(
-        200, {"ok": True, "queued": True, "alliance": STALE_TAG_ENVELOPE["alliance"]})
-    _provider.routes[("GET", STATUS_URL)] = _Resp(
-        200, {"ok": True, "queued": True, "started": False})
-    monkeypatch.setattr(mightpulse, "SITE_REFRESH_MAX_POLLS", 1)
-
-    data = asyncio.run(mightpulse.refresh_site_alliance(
-        AID, force=True, tag=OLD_TAG, bypass_local_cache=True))
-
+def test_refresh_refuses_stale_payload_when_refresh_never_completes(_provider):
+    _provider.routes[("GET", AID_URL)] = _Resp(
+        200, {"ok": True, "fresh": False, "refresh": "running",
+              "alliance": STALE_TAG_ENVELOPE["alliance"]})
+    data, _ = asyncio.run(mightpulse.fetch_current_alliance(AID, kid=KID, tag=None))
     assert data is None
+    assert mightpulse.get_cached_alliance(aid=AID) is None
+    assert _provider.calls == ([("GET", AID_URL + "&max_age=60")] * mightpulse.API_MAX_ATTEMPTS
+                               + [("GET", f"https://mightpulse.com/{KID}")])
 
 
 class _Settings:
@@ -309,6 +310,22 @@ def test_nightly_records_alias_and_new_tag_on_rename(monkeypatch):
     # The old tag stays resolvable for lookback / exclusions / academy commands.
     assert logic.nap_tag_aliases[OLD_TAG] == AID
     assert _SaveRecorder.saved[-1]["nap_tag_aliases"][OLD_TAG] == AID
+
+
+def test_nightly_uses_refreshed_power_instead_of_old_leaderboard(monkeypatch):
+    cog, upserts = _nightly_cog(
+        monkeypatch, rows=[_row(AID, NEW_TAG)],
+        fetched={"aid": AID, "abbr": NEW_TAG, "kid": KID, "power": 9500000},
+        nap_context=lambda _bot: (nap_mod.NapLogic(), {}),
+    )
+
+    async def discovery():
+        cog._discovered_power = {str(AID): 1858681076}
+        return 1
+
+    monkeypatch.setattr(cog, "_discover_candidates", discovery)
+    asyncio.run(cog._run_nightly_maintenance(triggered_by="test"))
+    assert upserts[0][1]["power"] == 9500000
 
 
 def test_nightly_records_alias_even_when_discovery_already_rewrote_the_tag(monkeypatch):
