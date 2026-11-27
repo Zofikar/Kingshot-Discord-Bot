@@ -128,6 +128,9 @@ class NightlyTasks(commands.Cog):
             refresh_failures = []
             rename_state = None
             discovered = await self._discover_candidates()
+            if discovered and self._discovered_power:
+                removed = storage.cleanup_dead_alliances(self._discovered_power)
+                logger.info("Nightly dead-alliance cleanup removed %s alliance(s): %s", len(removed), removed)
             for row in storage.all_alliances():
                 aid = row["alliance_id"]
                 tag = row["abbr"]

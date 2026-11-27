@@ -110,7 +110,65 @@ CREATE TABLE IF NOT EXISTS nap_ranking_history (
     posted_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_nap_history_posted_at ON nap_ranking_history(posted_at);
+CREATE TABLE IF NOT EXISTS nap_candidate_activity (
+    aid INTEGER PRIMARY KEY,
+    first_observed_at TEXT NOT NULL,
+    last_candidate_at TEXT
+);
 """
+
+
+def cleanup_dead_alliances(candidate_aids, *, db_dir="db", now=None) -> list:
+    """Record a successful candidate board and prune unneeded tracking rows.
+
+    Unknown history receives a full three-day grace period. Any Discord link
+    (main or alt) protects its alliance, without depending on member-cache health.
+    Player records, Discord roles, NAP history and blacklist records are retained.
+    """
+    candidates = {int(aid) for aid in candidate_aids}
+    if not candidates:
+        return []
+    ensure_schema(db_dir)
+    now = now or datetime.now(timezone.utc)
+    stamp = now.astimezone(timezone.utc).isoformat()
+    cutoff = (now - timedelta(days=3)).astimezone(timezone.utc).isoformat()
+    with _connect(os.path.join(db_dir, ALLIANCE_FILE)) as conn:
+        conn.execute("ATTACH DATABASE ? AS nap", (os.path.join(db_dir, VERIFICATION_FILE),))
+        conn.execute("ATTACH DATABASE ? AS players", (os.path.join(db_dir, USERS_FILE),))
+        with conn:
+            rows = conn.execute("SELECT alliance_id FROM alliance_list").fetchall()
+            for (aid,) in rows:
+                conn.execute(
+                    "INSERT OR IGNORE INTO nap.nap_candidate_activity (aid, first_observed_at) VALUES (?, ?)",
+                    (aid, stamp))
+            for aid in candidates:
+                conn.execute(
+                    "UPDATE nap.nap_candidate_activity SET last_candidate_at = ? WHERE aid = ?", (stamp, aid))
+            protected = set()
+            for main, academy in conn.execute("SELECT main_aid, academy_aid FROM nap.academies"):
+                protected.update((int(main), int(academy)))
+            protected.update(int(row[0]) for row in conn.execute("SELECT aid FROM nap.nap_exclusions"))
+            # Retain even expired blacklist records' alliances until explicitly
+            # unblacklisted; cleanup must never destroy moderation context.
+            blacklisted_fids = set()
+            for (raw,) in conn.execute("SELECT record_json FROM nap.player_blacklist"):
+                record = _load(raw)
+                blacklisted_fids.add(str(record["fid"]))
+                alliance = (record.get("player") or {}).get("alliance") or {}
+                if alliance.get("aid") is not None:
+                    protected.add(int(alliance["aid"]))
+            for fid, aid, discord_id in conn.execute("SELECT fid, alliance, discord_id FROM players.users"):
+                if aid not in (None, "") and (discord_id is not None or str(fid) in blacklisted_fids):
+                    protected.add(int(aid))
+            stale = conn.execute(
+                "SELECT a.alliance_id FROM alliance_list a JOIN nap.nap_candidate_activity c "
+                "ON c.aid = a.alliance_id WHERE COALESCE(c.last_candidate_at, c.first_observed_at) < ?",
+                (cutoff,)).fetchall()
+            removed = [aid for (aid,) in stale if aid not in protected and aid not in candidates]
+            for aid in removed:
+                conn.execute("DELETE FROM alliance_list WHERE alliance_id = ?", (aid,))
+                conn.execute("DELETE FROM nap.nap_candidate_activity WHERE aid = ?", (aid,))
+    return removed
 
 
 def _dump(obj) -> str:

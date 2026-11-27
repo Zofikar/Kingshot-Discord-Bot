@@ -47,6 +47,7 @@ async def run_preview(monkeypatch, kid):
 
     monkeypatch.setattr(nightly.storage, "all_alliances", lambda: list(rows.values()))
     monkeypatch.setattr(nightly.storage, "upsert_alliance", upsert)
+    monkeypatch.setattr(nightly.storage, "cleanup_dead_alliances", lambda candidates: [])
     monkeypatch.setattr(mightpulse, "fetch_current_alliance", tracked_refresh)
     bot = SimpleNamespace(extension_settings=Settings(), maintenance_lock=asyncio.Lock())
     task = nightly.NightlyTasks(bot)
