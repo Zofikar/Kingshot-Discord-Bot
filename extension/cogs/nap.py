@@ -100,11 +100,12 @@ async def post_nap_ranking(bot, *, triggered_by="scheduler"):
     # Wait for any in-progress nightly maintenance so the posted snapshot always
     # reflects the completed persisted ranking state (mirrors the monolith's lock).
     async with bot.maintenance_lock:
+        snapshot_warning = False
         if triggered_by == "scheduler":
             nightly = bot.get_cog("NightlyTasks")
             if nightly is None or not nightly.snapshot_ready_for_publication():
-                logger.error("Refusing scheduled NAP post: incomplete or older-than-10-minute snapshot.")
-                return False
+                snapshot_warning = True
+                logger.warning("Publishing scheduled NAP ranking using stored data: reset snapshot is incomplete or expired.")
         settings = _settings(bot)
         channel_id = settings.get_int("nap_channel_id")
         if not channel_id:
@@ -145,9 +146,9 @@ async def post_nap_ranking(bot, *, triggered_by="scheduler"):
             channel = bot.get_channel(channel_id)
             if channel is None:
                 channel = await bot.fetch_channel(channel_id)
-            if triggered_by == "scheduler" and not nightly.snapshot_ready_for_publication():
-                logger.error("NAP snapshot expired while preparing publication.")
-                return False
+            if triggered_by == "scheduler" and (
+                    snapshot_warning or nightly is None or not nightly.snapshot_ready_for_publication()):
+                message += "\n\n⚠️ Some alliance data could not be verified after reset; this ranking uses the latest stored power values."
             await channel.send(message)
         except (discord.NotFound, discord.Forbidden, discord.HTTPException) as e:
             logger.warning("Could not post NAP ranking to channel %s: %s", channel_id, e)

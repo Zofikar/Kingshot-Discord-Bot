@@ -85,14 +85,15 @@ class _StorageShim:
 
 
 @pytest.mark.parametrize("checks", [[False], [True, False]])
-def test_scheduled_post_rejects_expired_snapshot(tmp_path, monkeypatch, checks):
+def test_scheduled_post_warns_but_publishes_expired_snapshot(tmp_path, monkeypatch, checks):
     channel = _FakeChannel()
     bot = _prepare(monkeypatch, tmp_path, channel=channel)
     outcomes = iter(checks)
     guard = types.SimpleNamespace(snapshot_ready_for_publication=lambda: next(outcomes))
     bot.get_cog = lambda name: guard
-    assert asyncio.run(nap_cog.post_nap_ranking(bot)) is False
-    assert channel.messages == []
+    assert asyncio.run(nap_cog.post_nap_ranking(bot)) is True
+    assert len(channel.messages) == 1
+    assert "latest stored power values" in channel.messages[0]
 
 
 def _logic():
@@ -134,6 +135,30 @@ def test_unchanged_tags_skip_leaders_post_but_not_ranking(tmp_path, monkeypatch)
     assert asyncio.run(nap_cog.post_nap_ranking(bot)) is True
     assert len(channel.messages) == 3
     assert channel.messages[1] == "A10 A11"
+
+
+@pytest.mark.parametrize("snapshot", ["missing", "incomplete", "recovery_error"])
+def test_nightly_posts_stored_ranking_when_reset_refresh_is_unavailable(tmp_path, monkeypatch, snapshot):
+    channel = _FakeChannel()
+    bot = _prepare(monkeypatch, tmp_path, channel=channel,
+                   settings={"leaders_nap_post_channel": 456})
+    cog = nightly_mod.NightlyTasks(bot)
+    bot.get_cog = lambda name: cog
+    if snapshot != "missing":
+        cog.last_alliance_snapshot_date = datetime.now(timezone.utc).date()
+        cog.last_alliance_refresh_failures = [10]
+
+    async def recover():
+        if snapshot == "recovery_error":
+            raise RuntimeError("Upstream unavailable")
+
+    monkeypatch.setattr(cog, "_recover_publication_snapshot", recover)
+    assert asyncio.run(cog._post_nap_ranking()) is True
+    assert asyncio.run(cog._post_nap_ranking()) is True
+    assert len(channel.messages) == 3
+    assert channel.messages[1] == "A10 A11"
+    assert "latest stored power values" in channel.messages[0]
+    assert "latest stored power values" in channel.messages[2]
 
 
 def test_leaders_tag_baseline_survives_restart_and_ignores_order(tmp_path):

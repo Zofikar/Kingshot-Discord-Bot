@@ -430,14 +430,16 @@ class NightlyTasks(commands.Cog):
                 pass
         if (triggered_by == "scheduler"
                 and self.last_alliance_snapshot_date == datetime.now(timezone.utc).date()):
-            await self._recover_publication_snapshot()
+            try:
+                await self._recover_publication_snapshot()
+            except Exception:
+                logger.exception("NAP snapshot recovery failed; publishing latest stored ranking instead.")
         if triggered_by == "scheduler" and (
                 self.last_alliance_refresh_failures != []
                 or self.last_alliance_snapshot_date != datetime.now(timezone.utc).date()):
-            logger.error(
-                "Refusing scheduled NAP post: reset snapshot is unverified or incomplete; failed alliances=%s",
+            logger.warning(
+                "Publishing stored NAP ranking: reset snapshot is unverified or incomplete; failed alliances=%s",
                 self.last_alliance_refresh_failures)
-            return False
         from ..cogs.nap import post_nap_ranking
         return await post_nap_ranking(self.bot, triggered_by=triggered_by)
 
